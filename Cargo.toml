@@ -5,7 +5,7 @@ edition = "2021"
 authors = [ "mpw <x@mpw.sh>"]
 
 [dependencies]
-rocksdb = { version = "0.22.0", features = ["multi-threaded-cf"]}
+rocksdb = { git = "https://github.com/rust-rocksdb/rust-rocksdb", features = ["multi-threaded-cf"]}
 sha1 = "0.10.6"
 serde = { version = "1.0.203", features = ["derive"] }
 serde_json = "1.0.120"
@@ -21,6 +21,3 @@ tokio = { version = "1.0", features = ["full"] }
 rand = "0.8"
 futures = "0.3"
 num_cpus = "1.16"
-
-[patch.crates-io]
-librocksdb-sys = { version = "0.17.0" }

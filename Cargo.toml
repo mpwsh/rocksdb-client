@@ -21,3 +21,6 @@ tokio = { version = "1.0", features = ["full"] }
 rand = "0.8"
 futures = "0.3"
 num_cpus = "1.16"
+
+[patch.crates-io]
+librocksdb-sys = { version = "0.17.0" }

@@ -397,6 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Initializing database at {}", path);
     let db = RocksDB::open_cf(&opts, path, column_families)?;
+
     let db = Arc::new(db);
 
     let iterations = vec![100, 500, 2000, 50000];

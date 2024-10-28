@@ -1,8 +1,9 @@
 use std::path::Path;
 
-pub use rocksdb::{ColumnFamilyDescriptor, Options};
-use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
+pub use rocksdb::{ColumnFamilyDescriptor, Direction, Options};
+use rocksdb::{IteratorMode, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Serialize};
+use serde_json::{json, Value};
 pub mod errors;
 use std::sync::Arc;
 
@@ -31,12 +32,15 @@ pub trait KVStore: Sized {
     fn cf_exists(&self, name: &str) -> bool;
     fn insert_cf<T: Serialize>(&self, cf: &str, key: &str, value: &T) -> Result<(), KvStoreError>;
     fn get_cf<T: DeserializeOwned>(&self, cf: &str, key: &str) -> Result<T, KvStoreError>;
-    fn get_range_cf<T: DeserializeOwned>(
+    fn get_range_cf<T: DeserializeOwned + Serialize>(
         &self,
         cf: &str,
         from: &str,
         to: &str,
-    ) -> Result<Vec<T>, KvStoreError>;
+        limit: usize,
+        direction: Direction,
+        include_keys: bool,
+    ) -> Result<Vec<Value>, KvStoreError>;
     fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError>;
     fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError>;
 }
@@ -161,31 +165,64 @@ impl KVStore for RocksDB {
         serde_json::from_slice(&value).map_err(KvStoreError::from)
     }
 
-    fn get_range_cf<T: DeserializeOwned>(
+    fn get_range_cf<T: DeserializeOwned + Serialize>(
         &self,
         cf: &str,
         from: &str,
         to: &str,
-    ) -> Result<Vec<T>, KvStoreError> {
+        limit: usize,
+        direction: Direction,
+        include_keys: bool,
+    ) -> Result<Vec<Value>, KvStoreError> {
         let cf_handle = self
             .db
             .cf_handle(cf)
             .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
-        let iter = self.db.iterator_cf(
-            &cf_handle,
-            IteratorMode::From(from.as_bytes(), Direction::Forward),
-        );
-        let mut results = Vec::new();
-        for item in iter {
-            let (key, value) = item?;
-            if key > to.as_bytes().into() {
-                break;
+
+        // Get all keys first
+        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
+        let all_keys: Vec<Vec<u8>> = iter
+            .map(|r| r.map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+
+        // Parse indices, default to full range if invalid
+        let from_idx = from.parse::<usize>().unwrap_or(0);
+        let to_idx = to.parse::<usize>().unwrap_or(all_keys.len());
+
+        // Ensure indices are within bounds
+        let from_idx = from_idx.min(all_keys.len());
+        let to_idx = to_idx.min(all_keys.len());
+
+        // Get the actual keys we want based on direction
+        let keys_to_fetch = match direction {
+            Direction::Forward => all_keys[from_idx..to_idx].to_vec(),
+            Direction::Reverse => {
+                let mut keys = all_keys[from_idx..to_idx].to_vec();
+                keys.reverse();
+                keys
             }
-            let deserialized: T = serde_json::from_slice(&value)?;
-            results.push(deserialized);
+        };
+
+        // Fetch values for these keys
+        let mut results = Vec::new();
+        for key in keys_to_fetch.iter().take(limit) {
+            if let Some(value) = self.db.get_cf(&cf_handle, key)? {
+                let deserialized: T = serde_json::from_slice(&value)?;
+                let item = if include_keys {
+                    json!({
+                        "key": String::from_utf8_lossy(key).into_owned(),
+                        "value": deserialized
+                    })
+                } else {
+                    json!(deserialized)
+                };
+                results.push(item);
+            }
         }
+
         Ok(results)
     }
+
     fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError> {
         let cf_handle = self
             .db

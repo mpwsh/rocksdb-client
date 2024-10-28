@@ -3,7 +3,6 @@ use std::path::Path;
 pub use rocksdb::{ColumnFamilyDescriptor, Options};
 use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Serialize};
-use sha1::{Digest, Sha1};
 pub mod errors;
 use std::sync::Arc;
 
@@ -107,25 +106,22 @@ impl KVStore for RocksDB {
     }
 
     fn get<T: DeserializeOwned>(&self, key: &str) -> Result<T, KvStoreError> {
-        let hashed_key = hash_key(key);
         let value = self
-            .find(&hashed_key)?
+            .find(key)?
             .ok_or_else(|| KvStoreError::KeyNotFound(key.to_string()))?;
         serde_json::from_slice(&value).map_err(KvStoreError::from)
     }
 
     fn insert<T: Serialize>(&self, key: &str, v: &T) -> Result<(), KvStoreError> {
-        let hashed_key = hash_key(key);
         let serialized = serde_json::to_vec(v)?;
-        self.save(&hashed_key, &serialized)
+        self.save(key, &serialized)
     }
     fn batch_insert<T: Serialize>(&self, items: &[(&str, &T)]) -> Result<(), KvStoreError> {
         let mut batch = WriteBatch::default();
 
         for (key, value) in items {
-            let hashed_key = hash_key(key);
             let serialized = serde_json::to_vec(value)?;
-            batch.put(hashed_key.as_bytes(), &serialized);
+            batch.put(key.as_bytes(), &serialized);
         }
 
         self.db.write(batch).map_err(KvStoreError::from)
@@ -191,7 +187,6 @@ impl KVStore for RocksDB {
         Ok(results)
     }
     fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError> {
-        let cf = &hash_key(cf);
         let cf_handle = self
             .db
             .cf_handle(cf)
@@ -204,10 +199,4 @@ impl KVStore for RocksDB {
     fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError> {
         self.db.drop_cf(cf).map_err(KvStoreError::from)
     }
-}
-
-fn hash_key(key: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hex::encode(hasher.finalize())
 }

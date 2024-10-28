@@ -191,6 +191,10 @@ impl KVStore for RocksDB {
             .db
             .cf_handle(cf)
             .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let _ = self
+            .db
+            .get_cf(&cf_handle, key.as_bytes())?
+            .ok_or(KvStoreError::KeyNotFound(key.to_string()))?;
         self.db
             .delete_cf(&cf_handle, key.as_bytes())
             .map_err(KvStoreError::from)

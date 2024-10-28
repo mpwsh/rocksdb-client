@@ -179,21 +179,17 @@ impl KVStore for RocksDB {
             .cf_handle(cf)
             .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
 
-        // Get all keys first
         let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
         let all_keys: Vec<Vec<u8>> = iter
             .map(|r| r.map(|(k, _)| k.to_vec()))
             .collect::<Result<_, _>>()?;
 
-        // Parse indices, default to full range if invalid
         let from_idx = from.parse::<usize>().unwrap_or(0);
         let to_idx = to.parse::<usize>().unwrap_or(all_keys.len());
 
-        // Ensure indices are within bounds
         let from_idx = from_idx.min(all_keys.len());
-        let to_idx = to_idx.min(all_keys.len());
+        let to_idx = (to_idx + 1).min(all_keys.len());
 
-        // Get the actual keys we want based on direction
         let keys_to_fetch = match direction {
             Direction::Forward => all_keys[from_idx..to_idx].to_vec(),
             Direction::Reverse => {
@@ -203,7 +199,6 @@ impl KVStore for RocksDB {
             }
         };
 
-        // Fetch values for these keys
         let mut results = Vec::new();
         for key in keys_to_fetch.iter().take(limit) {
             if let Some(value) = self.db.get_cf(&cf_handle, key)? {
@@ -219,7 +214,6 @@ impl KVStore for RocksDB {
                 results.push(item);
             }
         }
-
         Ok(results)
     }
 

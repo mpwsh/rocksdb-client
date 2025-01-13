@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rocksdb_client::{KVStore, KvStoreError, Options, RocksDB};
+use rocksdb_client::{Direction, KVStore, KvStoreError, Options, RocksDB};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -141,7 +141,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate range queries
     println!("\nRooms within ID range 1-2:");
-    let range_rooms: Vec<Room> = db.get_range_cf("rooms", "1", "2")?;
+    let range_rooms: Vec<Room> =
+        db.get_range_cf("rooms", "1", "2", 1000, Direction::Forward, false)?;
     for room in range_rooms {
         println!("Room in range: {:?}", room);
     }
@@ -154,7 +155,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 // Helper function to filter rooms by style
 fn filter_rooms_by_style(db: &RocksDB, style: MatchStyle) -> Result<Vec<Room>, KvStoreError> {
-    let rooms: Vec<Room> = db.get_range_cf("rooms", "0", "999")?;
+    let rooms: Vec<Room> = db.get_range_cf("rooms", "0", "999", 1000, Direction::Forward, false)?;
     Ok(rooms
         .into_iter()
         .filter(|room| room.style == style)
@@ -177,21 +178,29 @@ fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
 
     // Print rooms
     println!("\nRooms:");
-    let rooms: Vec<Room> = db.get_range_cf("rooms", "0", "999")?;
+    let rooms: Vec<Room> = db.get_range_cf("rooms", "0", "999", 1000, Direction::Forward, false)?;
     for room in rooms {
         println!("- {:?}", room);
     }
 
     // Print settings
     println!("\nSettings:");
-    let settings: Vec<Settings> = db.get_range_cf("settings", "0", "999")?;
+    let settings: Vec<Settings> =
+        db.get_range_cf("settings", "0", "999", 1000, Direction::Forward, false)?;
     for setting in settings {
         println!("- {:?}", setting);
     }
 
     // Print archived rooms
     println!("\nArchived Rooms:");
-    let archived_rooms: Vec<Room> = db.get_range_cf("archived_rooms", "0", "999")?;
+    let archived_rooms: Vec<Room> = db.get_range_cf(
+        "archived_rooms",
+        "0",
+        "999",
+        1000,
+        Direction::Forward,
+        false,
+    )?;
     for room in archived_rooms {
         println!("- {:?}", room);
     }

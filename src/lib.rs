@@ -2,12 +2,18 @@ use std::path::Path;
 
 pub use rocksdb::{ColumnFamilyDescriptor, Direction, Options};
 use rocksdb::{IteratorMode, WriteBatch, DB};
-use serde::{de::DeserializeOwned, Serialize};
-use serde_json::{json, Value};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::json;
 pub mod errors;
 use std::sync::Arc;
 
 pub use errors::KvStoreError;
+
+#[derive(Serialize, Deserialize)]
+pub struct KeyValuePair<T> {
+    pub key: String,
+    pub value: T,
+}
 
 pub trait KVStore: Sized {
     fn open<P: AsRef<Path>>(path: P, opts: &Options) -> Result<Self, KvStoreError>;
@@ -40,7 +46,7 @@ pub trait KVStore: Sized {
         limit: usize,
         direction: Direction,
         include_keys: bool,
-    ) -> Result<Vec<Value>, KvStoreError>;
+    ) -> Result<Vec<T>, KvStoreError>;
     fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError>;
     fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError>;
 }
@@ -173,7 +179,7 @@ impl KVStore for RocksDB {
         limit: usize,
         direction: Direction,
         include_keys: bool,
-    ) -> Result<Vec<Value>, KvStoreError> {
+    ) -> Result<Vec<T>, KvStoreError> {
         let cf_handle = self
             .db
             .cf_handle(cf)
@@ -186,7 +192,6 @@ impl KVStore for RocksDB {
 
         let from_idx = from.parse::<usize>().unwrap_or(0);
         let to_idx = to.parse::<usize>().unwrap_or(all_keys.len());
-
         let from_idx = from_idx.min(all_keys.len());
         let to_idx = (to_idx + 1).min(all_keys.len());
 
@@ -202,18 +207,19 @@ impl KVStore for RocksDB {
         let mut results = Vec::new();
         for key in keys_to_fetch.iter().take(limit) {
             if let Some(value) = self.db.get_cf(&cf_handle, key)? {
-                let deserialized: T = serde_json::from_slice(&value)?;
-                let item = if include_keys {
-                    json!({
+                let deserialized: T = if include_keys {
+                    let inner: T = serde_json::from_slice(&value)?;
+                    serde_json::from_value(json!({
                         "key": String::from_utf8_lossy(key).into_owned(),
-                        "value": deserialized
-                    })
+                        "value": inner
+                    }))?
                 } else {
-                    json!(deserialized)
+                    serde_json::from_slice(&value)?
                 };
-                results.push(item);
+                results.push(deserialized);
             }
         }
+
         Ok(results)
     }
 

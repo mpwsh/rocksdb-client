@@ -162,12 +162,24 @@ fn filter_rooms_by_style(db: &RocksDB, style: MatchStyle) -> Result<Vec<Room>, K
         .collect())
 }
 
-// Helper function to print contents of all column families
+// Helper function to print contents and sizes of all column families
 fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
-    println!("\nContents of all column families:");
+    println!("\nContents and sizes of all column families:");
+
+    // Helper function to print CF size
+    let print_cf_size = |cf: &str| -> Result<(), KvStoreError> {
+        let size = db.get_cf_size(cf)?;
+        println!("\n{} Size:", cf);
+        println!("  Total: {:.2} MB", size.total_mb());
+        println!("  SST Files: {} bytes", size.sst_bytes);
+        println!("  Memtable: {} bytes", size.mem_table_bytes);
+        println!("  Blob Files: {} bytes", size.blob_bytes);
+        Ok(())
+    };
 
     // Print users (from default CF)
     println!("\nUsers:");
+    print_cf_size("default")?;
     for id in 1..=3 {
         match db.get::<User>(&id.to_string()) {
             Ok(user) => println!("- {:?}", user),
@@ -178,6 +190,7 @@ fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
 
     // Print rooms
     println!("\nRooms:");
+    print_cf_size("rooms")?;
     let rooms: Vec<Room> = db.get_range_cf("rooms", "0", "999", 1000, Direction::Forward, false)?;
     for room in rooms {
         println!("- {:?}", room);
@@ -185,6 +198,7 @@ fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
 
     // Print settings
     println!("\nSettings:");
+    print_cf_size("settings")?;
     let settings: Vec<Settings> =
         db.get_range_cf("settings", "0", "999", 1000, Direction::Forward, false)?;
     for setting in settings {
@@ -193,6 +207,7 @@ fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
 
     // Print archived rooms
     println!("\nArchived Rooms:");
+    print_cf_size("archived_rooms")?;
     let archived_rooms: Vec<Room> = db.get_range_cf(
         "archived_rooms",
         "0",

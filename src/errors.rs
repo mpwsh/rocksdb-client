@@ -19,4 +19,6 @@ pub enum KvStoreError {
     Utf8Error(#[from] FromUtf8Error),
     #[error("System time error: {0}")]
     SystemTimeError(#[from] SystemTimeError),
+    #[error("Property access error: {0}")]
+    PropertyAccessError(String),
 }

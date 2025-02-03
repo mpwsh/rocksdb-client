@@ -14,7 +14,20 @@ pub struct KeyValuePair<T> {
     pub key: String,
     pub value: T,
 }
+// Add the CFSize struct
+#[derive(Debug, Clone, Serialize)]
+pub struct CFSize {
+    pub total_bytes: u64,
+    pub sst_bytes: u64,
+    pub mem_table_bytes: u64,
+    pub blob_bytes: u64,
+}
 
+impl CFSize {
+    pub fn total_mb(&self) -> f64 {
+        self.total_bytes as f64 / (1024.0 * 1024.0)
+    }
+}
 pub trait KVStore: Sized {
     fn open<P: AsRef<Path>>(path: P, opts: &Options) -> Result<Self, KvStoreError>;
     fn open_default<P: AsRef<Path>>(path: P) -> Result<Self, KvStoreError>;
@@ -49,6 +62,7 @@ pub trait KVStore: Sized {
     ) -> Result<Vec<T>, KvStoreError>;
     fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError>;
     fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError>;
+    fn get_cf_size(&self, cf: &str) -> Result<CFSize, KvStoreError>;
 }
 
 #[derive(Clone)]
@@ -239,5 +253,36 @@ impl KVStore for RocksDB {
 
     fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError> {
         self.db.drop_cf(cf).map_err(KvStoreError::from)
+    }
+    fn get_cf_size(&self, cf: &str) -> Result<CFSize, KvStoreError> {
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+
+        let live_sst_size = self
+            .db
+            .property_int_value_cf(&cf_handle, "rocksdb.total-sst-files-size")
+            .map_err(|e| KvStoreError::PropertyAccessError(e.to_string()))?
+            .unwrap_or(0);
+
+        let mem_table_size = self
+            .db
+            .property_int_value_cf(&cf_handle, "rocksdb.size-all-mem-tables")
+            .map_err(|e| KvStoreError::PropertyAccessError(e.to_string()))?
+            .unwrap_or(0);
+
+        let blob_size = self
+            .db
+            .property_int_value_cf(&cf_handle, "rocksdb.total-blob-file-size")
+            .map_err(|e| KvStoreError::PropertyAccessError(e.to_string()))?
+            .unwrap_or(0);
+
+        Ok(CFSize {
+            total_bytes: live_sst_size + mem_table_size + blob_size,
+            sst_bytes: live_sst_size,
+            mem_table_bytes: mem_table_size,
+            blob_bytes: blob_size,
+        })
     }
 }

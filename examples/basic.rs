@@ -149,6 +149,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Print all entries in each column family
     print_cf_contents(&db)?;
+    // Create backup of rooms
+    println!("\n=== Creating backup of rooms collection ===");
+    db.create_backup("rooms", "rooms_backup.sst")?;
+    println!("Backup created successfully");
+
+    // Drop the rooms collection
+    println!("\n=== Dropping rooms collection ===");
+    db.drop_cf("rooms")?;
+    println!("Collection dropped");
+
+    // Create new empty rooms collection
+    db.create_cf("rooms")?;
+
+    // Print state after drop
+    println!("\n=== State after dropping rooms ===");
+    print_cf_contents(&db)?;
+
+    // Restore from backup
+    println!("\n=== Restoring rooms from backup ===");
+    db.restore_backup("rooms", "rooms_backup.sst")?;
+    println!("Restore completed");
+
+    // Print final state
+    println!("\n=== Final State after restore ===");
+    print_cf_contents(&db)?;
+    println!("\nQuerying rooms where id = 2:");
+    let query = r#"{
+    "==": [{"var": "id"}, 2]
+}"#;
+    let matching_rooms: Vec<Room> = db.query_cf("rooms", query)?;
+    for room in matching_rooms {
+        println!("Found room: {:?}", room);
+    }
+
+    let complex_query = r#"{
+    "and": [
+        {">": [{"var": "id"}, 1]},
+        {"==": [{"var": "style"}, "Dm"]}
+    ]
+}"#;
+
+    println!("Finding Team rooms with id > 1 and style == Team");
+    let team_rooms: Vec<Room> = db.query_cf("rooms", complex_query)?;
+    println!("Found rooms (complex query): {team_rooms:?}");
 
     Ok(())
 }

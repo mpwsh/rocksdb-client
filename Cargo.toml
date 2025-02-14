@@ -1,6 +1,6 @@
 [package]
 name = "rocksdb-client"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 authors = [ "mpw <x@mpw.sh>"]
 
@@ -12,6 +12,7 @@ hex = "0.4.3"
 thiserror = "1.0.61"
 bytes = "1.8.0"
 log = "0.4.22"
+jsonlogic-rs = "0.5.0"
 
 [dev-dependencies]
 tempfile = "3.10.1"

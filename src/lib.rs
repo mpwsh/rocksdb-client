@@ -1,7 +1,8 @@
+use serde_json::Value;
 use std::path::Path;
 
 pub use rocksdb::{ColumnFamilyDescriptor, Direction, Options};
-use rocksdb::{IteratorMode, WriteBatch, DB};
+use rocksdb::{IngestExternalFileOptions, IteratorMode, SstFileWriter, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 pub mod errors;
@@ -63,6 +64,13 @@ pub trait KVStore: Sized {
     fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError>;
     fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError>;
     fn get_cf_size(&self, cf: &str) -> Result<CFSize, KvStoreError>;
+    fn query_cf<T: DeserializeOwned + Serialize>(
+        &self,
+        cf: &str,
+        logic: &str,
+    ) -> Result<Vec<T>, KvStoreError>;
+    fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
+    fn restore_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
 }
 
 #[derive(Clone)]
@@ -284,5 +292,90 @@ impl KVStore for RocksDB {
             mem_table_bytes: mem_table_size,
             blob_bytes: blob_size,
         })
+    }
+    fn query_cf<T: DeserializeOwned + Serialize>(
+        &self,
+        cf: &str,
+        logic: &str,
+    ) -> Result<Vec<T>, KvStoreError> {
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+
+        // Parse the JsonLogic rule
+        let rule: Value = serde_json::from_str(logic)
+            .map_err(|e| KvStoreError::InvalidQuery(format!("Invalid JsonLogic: {}", e)))?;
+
+        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
+        let mut results = Vec::new();
+
+        for item in iter {
+            let (_, value_bytes) = item?;
+            let value: Value = serde_json::from_slice(&value_bytes)?;
+
+            // Apply JsonLogic rule
+            match jsonlogic_rs::apply(&rule, &value) {
+                Ok(result) => {
+                    if result.as_bool().unwrap_or(false) {
+                        let typed_value: T = serde_json::from_value(value)
+                            .map_err(KvStoreError::SerializationError)?;
+                        results.push(typed_value);
+                    }
+                }
+                Err(e) => {
+                    return Err(KvStoreError::InvalidQuery(format!(
+                        "JsonLogic error: {}",
+                        e
+                    )))
+                }
+            }
+        }
+
+        Ok(results)
+    }
+    fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+
+        // Create a new SST file writer
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        let mut writer = SstFileWriter::create(&opts);
+
+        // Open the writer with the specified file path
+        writer.open(path)?;
+
+        // Get an iterator over the CF
+        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
+
+        // Write all KV pairs to the SST file
+        for item in iter {
+            let (key, value) = item?;
+            writer.put(&key, &value)?;
+        }
+
+        // Finish writing and close the file
+        writer.finish()?;
+
+        Ok(())
+    }
+
+    fn restore_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+
+        // Create ingest options
+        let ingest_opts = IngestExternalFileOptions::default();
+
+        // Ingest the SST file
+        self.db
+            .ingest_external_file_cf_opts(&cf_handle, &ingest_opts, vec![path])?;
+
+        Ok(())
     }
 }

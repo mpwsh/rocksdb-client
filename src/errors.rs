@@ -21,4 +21,6 @@ pub enum KvStoreError {
     SystemTimeError(#[from] SystemTimeError),
     #[error("Property access error: {0}")]
     PropertyAccessError(String),
+    #[error("Query error: {0}")]
+    InvalidQuery(String),
 }

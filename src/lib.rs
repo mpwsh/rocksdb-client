@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::path::Path;
 
-pub use rocksdb::{ColumnFamilyDescriptor, Direction, Options};
+pub use rocksdb::{ColumnFamilyDescriptor, CuckooTableOptions, Direction, Options};
 use rocksdb::{IngestExternalFileOptions, IteratorMode, SstFileWriter, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
@@ -48,6 +48,11 @@ pub trait KVStore: Sized {
     fn get<T: DeserializeOwned>(&self, key: &str) -> Result<T, KvStoreError>;
     fn insert<T: Serialize>(&self, key: &str, v: &T) -> Result<(), KvStoreError>;
     fn batch_insert<T: Serialize>(&self, items: &[(&str, &T)]) -> Result<(), KvStoreError>;
+    fn batch_insert_cf<T: Serialize>(
+        &self,
+        cf: &str,
+        items: &[(&str, &T)],
+    ) -> Result<(), KvStoreError>;
     fn create_cf(&self, name: &str) -> Result<(), KvStoreError>;
     fn cf_exists(&self, name: &str) -> bool;
     fn insert_cf<T: Serialize>(&self, cf: &str, key: &str, value: &T) -> Result<(), KvStoreError>;
@@ -154,6 +159,24 @@ impl KVStore for RocksDB {
         for (key, value) in items {
             let serialized = serde_json::to_vec(value)?;
             batch.put(key.as_bytes(), &serialized);
+        }
+
+        self.db.write(batch).map_err(KvStoreError::from)
+    }
+    fn batch_insert_cf<T: Serialize>(
+        &self,
+        cf: &str,
+        items: &[(&str, &T)],
+    ) -> Result<(), KvStoreError> {
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+
+        let mut batch = WriteBatch::default();
+        for (key, value) in items {
+            let serialized = serde_json::to_vec(value)?;
+            batch.put_cf(&cf_handle, key.as_bytes(), &serialized);
         }
 
         self.db.write(batch).map_err(KvStoreError::from)

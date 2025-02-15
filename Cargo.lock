@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "rocksdb-client"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "bytes",
  "futures",

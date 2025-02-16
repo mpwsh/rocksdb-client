@@ -4,7 +4,6 @@ use std::path::Path;
 pub use rocksdb::{ColumnFamilyDescriptor, CuckooTableOptions, Direction, Options};
 use rocksdb::{IngestExternalFileOptions, IteratorMode, SstFileWriter, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use serde_json::json;
 pub mod errors;
 use std::sync::Arc;
 
@@ -15,7 +14,23 @@ pub struct KeyValuePair<T> {
     pub key: String,
     pub value: T,
 }
-// Add the CFSize struct
+
+pub trait ByteSerializer {
+    fn serialize<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, KvStoreError>;
+    fn deserialize<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, KvStoreError>;
+}
+
+pub struct MessagePackSerializer;
+
+impl ByteSerializer for MessagePackSerializer {
+    fn serialize<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, KvStoreError> {
+        rmp_serde::to_vec(value).map_err(Into::into)
+    }
+
+    fn deserialize<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, KvStoreError> {
+        rmp_serde::from_slice(bytes).map_err(Into::into)
+    }
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct CFSize {
     pub total_bytes: u64,
@@ -41,6 +56,7 @@ pub trait KVStore: Sized {
         opts: &Options,
         path: P,
     ) -> Result<Self, KvStoreError>;
+    fn cf_handle(&self, cf: &str) -> Result<Arc<rocksdb::BoundColumnFamily>, KvStoreError>;
     fn save(&self, k: &str, v: &[u8]) -> Result<(), KvStoreError>;
     fn find(&self, k: &str) -> Result<Option<Vec<u8>>, KvStoreError>;
     fn delete(&self, k: &str) -> Result<(), KvStoreError>;
@@ -126,6 +142,11 @@ impl KVStore for RocksDB {
 
         Self::open_cf(opts, path, cf_names)
     }
+    fn cf_handle(&self, cf: &str) -> Result<Arc<rocksdb::BoundColumnFamily>, KvStoreError> {
+        self.db
+            .cf_handle(cf)
+            .ok_or_else(|| KvStoreError::InvalidColumnFamily(cf.to_string()))
+    }
     fn list_cf(path: &str) -> Result<Vec<String>, KvStoreError> {
         let cf_names = DB::list_cf(&Options::default(), path).map_err(KvStoreError::from)?;
         Ok(cf_names)
@@ -146,18 +167,18 @@ impl KVStore for RocksDB {
         let value = self
             .find(key)?
             .ok_or_else(|| KvStoreError::KeyNotFound(key.to_string()))?;
-        serde_json::from_slice(&value).map_err(KvStoreError::from)
+        MessagePackSerializer.deserialize(&value)
     }
 
     fn insert<T: Serialize>(&self, key: &str, v: &T) -> Result<(), KvStoreError> {
-        let serialized = serde_json::to_vec(v)?;
+        let serialized = MessagePackSerializer.serialize(v)?;
         self.save(key, &serialized)
     }
     fn batch_insert<T: Serialize>(&self, items: &[(&str, &T)]) -> Result<(), KvStoreError> {
         let mut batch = WriteBatch::default();
 
         for (key, value) in items {
-            let serialized = serde_json::to_vec(value)?;
+            let serialized = MessagePackSerializer.serialize(value)?;
             batch.put(key.as_bytes(), &serialized);
         }
 
@@ -168,14 +189,11 @@ impl KVStore for RocksDB {
         cf: &str,
         items: &[(&str, &T)],
     ) -> Result<(), KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let cf_handle = self.cf_handle(cf)?;
 
         let mut batch = WriteBatch::default();
         for (key, value) in items {
-            let serialized = serde_json::to_vec(value)?;
+            let serialized = MessagePackSerializer.serialize(value)?;
             batch.put_cf(&cf_handle, key.as_bytes(), &serialized);
         }
 
@@ -194,26 +212,21 @@ impl KVStore for RocksDB {
         self.db.cf_handle(name).is_some()
     }
     fn insert_cf<T: Serialize>(&self, cf: &str, key: &str, value: &T) -> Result<(), KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
-        let serialized = serde_json::to_vec(value)?;
+        let cf_handle = self.cf_handle(cf)?;
+
+        let serialized = MessagePackSerializer.serialize(value)?;
         self.db
             .put_cf(&cf_handle, key.as_bytes(), serialized)
             .map_err(KvStoreError::from)
     }
 
     fn get_cf<T: DeserializeOwned>(&self, cf: &str, key: &str) -> Result<T, KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let cf_handle = self.cf_handle(cf)?;
         let value = self
             .db
             .get_cf(&cf_handle, key.as_bytes())?
             .ok_or(KvStoreError::KeyNotFound(key.to_string()))?;
-        serde_json::from_slice(&value).map_err(KvStoreError::from)
+        MessagePackSerializer.deserialize(&value)
     }
 
     fn get_range_cf<T: DeserializeOwned + Serialize>(
@@ -225,10 +238,7 @@ impl KVStore for RocksDB {
         direction: Direction,
         include_keys: bool,
     ) -> Result<Vec<T>, KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let cf_handle = self.cf_handle(cf)?;
 
         let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
         let all_keys: Vec<Vec<u8>> = iter
@@ -253,13 +263,16 @@ impl KVStore for RocksDB {
         for key in keys_to_fetch.iter().take(limit) {
             if let Some(value) = self.db.get_cf(&cf_handle, key)? {
                 let deserialized: T = if include_keys {
-                    let inner: T = serde_json::from_slice(&value)?;
-                    serde_json::from_value(json!({
-                        "key": String::from_utf8_lossy(key).into_owned(),
-                        "value": inner
-                    }))?
+                    let inner: T = MessagePackSerializer.deserialize(&value)?;
+
+                    let key_value = KeyValuePair {
+                        key: String::from_utf8_lossy(key).into_owned(),
+                        value: inner,
+                    };
+                    MessagePackSerializer
+                        .deserialize(&MessagePackSerializer.serialize(&key_value)?)?
                 } else {
-                    serde_json::from_slice(&value)?
+                    MessagePackSerializer.deserialize(&value)?
                 };
                 results.push(deserialized);
             }
@@ -269,10 +282,8 @@ impl KVStore for RocksDB {
     }
 
     fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let cf_handle = self.cf_handle(cf)?;
+
         let _ = self
             .db
             .get_cf(&cf_handle, key.as_bytes())?
@@ -286,10 +297,7 @@ impl KVStore for RocksDB {
         self.db.drop_cf(cf).map_err(KvStoreError::from)
     }
     fn get_cf_size(&self, cf: &str) -> Result<CFSize, KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let cf_handle = self.cf_handle(cf)?;
 
         let live_sst_size = self
             .db
@@ -321,10 +329,7 @@ impl KVStore for RocksDB {
         cf: &str,
         logic: &str,
     ) -> Result<Vec<T>, KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let cf_handle = self.cf_handle(cf)?;
 
         // Parse the JsonLogic rule
         let rule: Value = serde_json::from_str(logic)
@@ -335,15 +340,17 @@ impl KVStore for RocksDB {
 
         for item in iter {
             let (_, value_bytes) = item?;
-            let value: Value = serde_json::from_slice(&value_bytes)?;
 
-            // Apply JsonLogic rule
-            match jsonlogic_rs::apply(&rule, &value) {
+            // deserialize from messagepack to temporary json value for query
+            let value: T = MessagePackSerializer.deserialize(&value_bytes)?;
+            // convert to json value for jsonlogic
+            let value_for_query = serde_json::to_value(&value)
+                .map_err(|e| KvStoreError::SerializationError(e.to_string()))?;
+
+            match jsonlogic_rs::apply(&rule, &value_for_query) {
                 Ok(result) => {
                     if result.as_bool().unwrap_or(false) {
-                        let typed_value: T = serde_json::from_value(value)
-                            .map_err(KvStoreError::SerializationError)?;
-                        results.push(typed_value);
+                        results.push(value);
                     }
                 }
                 Err(e) => {
@@ -358,10 +365,7 @@ impl KVStore for RocksDB {
         Ok(results)
     }
     fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let cf_handle = self.cf_handle(cf)?;
 
         // Create a new SST file writer
         let mut opts = Options::default();
@@ -387,10 +391,7 @@ impl KVStore for RocksDB {
     }
 
     fn restore_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let cf_handle = self.cf_handle(cf)?;
 
         // Create ingest options
         let ingest_opts = IngestExternalFileOptions::default();

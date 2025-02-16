@@ -1,6 +1,6 @@
-use serde_json::Value;
 use std::path::Path;
 
+use jmespath::{Runtime, Variable};
 pub use rocksdb::{ColumnFamilyDescriptor, CuckooTableOptions, Direction, Options};
 use rocksdb::{IngestExternalFileOptions, IteratorMode, SstFileWriter, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -327,41 +327,63 @@ impl KVStore for RocksDB {
     fn query_cf<T: DeserializeOwned + Serialize>(
         &self,
         cf: &str,
-        logic: &str,
+        query: &str,
     ) -> Result<Vec<T>, KvStoreError> {
-        let cf_handle = self.cf_handle(cf)?;
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
 
-        // Parse the JsonLogic rule
-        let rule: Value = serde_json::from_str(logic)
-            .map_err(|e| KvStoreError::InvalidQuery(format!("Invalid JsonLogic: {}", e)))?;
+        let runtime = Runtime::new();
+        let expr = runtime
+            .compile(query)
+            .map_err(|e| KvStoreError::InvalidQuery(format!("Invalid JMESPath: {}", e)))?;
 
         let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
         let mut results = Vec::new();
 
         for item in iter {
             let (_, value_bytes) = item?;
-
-            // deserialize from messagepack to temporary json value for query
             let value: T = MessagePackSerializer.deserialize(&value_bytes)?;
-            // convert to json value for jsonlogic
-            let value_for_query = serde_json::to_value(&value)
+            let value_json = serde_json::to_value(&value)
                 .map_err(|e| KvStoreError::SerializationError(e.to_string()))?;
 
-            match jsonlogic_rs::apply(&rule, &value_for_query) {
+            match expr.search(&value_json) {
                 Ok(result) => {
-                    if result.as_bool().unwrap_or(false) {
-                        results.push(value);
+                    // convert Variable to bool
+                    match &*result {
+                        Variable::Bool(b) => {
+                            if *b {
+                                results.push(value)
+                            }
+                        }
+                        Variable::Number(n) => {
+                            if n.as_f64().unwrap_or(0.0) != 0.0 {
+                                results.push(value)
+                            }
+                        }
+                        Variable::String(s) => {
+                            if !s.is_empty() {
+                                results.push(value)
+                            }
+                        }
+                        Variable::Array(a) => {
+                            if !a.is_empty() {
+                                results.push(value)
+                            }
+                        }
+                        Variable::Object(o) => {
+                            if !o.is_empty() {
+                                results.push(value)
+                            }
+                        }
+                        Variable::Null => {}
+                        Variable::Expref(_) => {} // function refs are considered falsy
                     }
                 }
-                Err(e) => {
-                    return Err(KvStoreError::InvalidQuery(format!(
-                        "JsonLogic error: {}",
-                        e
-                    )))
-                }
+                Err(e) => return Err(KvStoreError::InvalidQuery(format!("JMESPath error: {}", e))),
             }
         }
-
         Ok(results)
     }
     fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {

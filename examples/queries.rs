@@ -43,36 +43,32 @@ async fn run_query_benchmark(db: Arc<RocksDB>, num_rooms: usize) -> Result<(), K
     }
     println!("Insertion took: {:?}", insert_start.elapsed());
 
-    // Define our test queries
     let queries = vec![
-        ("Find rooms with id = 5", r#"{"==": [{"var": "id"}, 5]}"#),
-        ("Find Team rooms", r#"{"==": [{"var": "style"}, "Team"]}"#),
+        ("Find rooms with id = 5", "id == `5`"),
+        ("Find Team rooms", "style == 'Team'"),
         (
             "Find available Team rooms",
-            r#"{
-                "and": [
-                    {"==": [{"var": "style"}, "Team"]},
-                    {"<": [{"var": "player_count"}, {"var": "capacity"}]}
-                ]
-            }"#,
+            "style == 'Team' && player_count < capacity",
         ),
         (
             "Find popular rooms",
-            r#"{
-                "and": [
-                    {">": [{"var": "player_count"}, 5]},
-                    {"==": [{"var": "is_private"}, false]}
-                ]
-            }"#,
+            "player_count > `5` && is_private == `false`",
         ),
         (
             "Find empty public rooms",
-            r#"{
-                "and": [
-                    {"==": [{"var": "player_count"}, 0]},
-                    {"==": [{"var": "is_private"}, false]}
-                ]
-            }"#,
+            "player_count == `0` && is_private == `false`",
+        ),
+        (
+            "Find rooms with specific tag",
+            "tags[?@ == 'abc'] | [0] != null", // using pipe to check if array has elements
+        ),
+        (
+            "Find rooms with any tags",
+            "tags[0] != null", // simple check if array has at least one element
+        ),
+        (
+            "Find recent team rooms",
+            "style == 'Team' && created_at > `1234567890`",
         ),
     ];
 

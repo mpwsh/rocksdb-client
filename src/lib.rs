@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use jmespath::{Runtime, Variable};
+use jsonpath_rust::JsonPath;
 pub use rocksdb::{ColumnFamilyDescriptor, CuckooTableOptions, Direction, Options};
 use rocksdb::{IngestExternalFileOptions, IteratorMode, SstFileWriter, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -88,7 +88,8 @@ pub trait KVStore: Sized {
     fn query_cf<T: DeserializeOwned + Serialize>(
         &self,
         cf: &str,
-        logic: &str,
+        query: &str,
+        include_keys: bool,
     ) -> Result<Vec<T>, KvStoreError>;
     fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
     fn restore_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
@@ -239,7 +240,6 @@ impl KVStore for RocksDB {
         include_keys: bool,
     ) -> Result<Vec<T>, KvStoreError> {
         let cf_handle = self.cf_handle(cf)?;
-
         let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
         let all_keys: Vec<Vec<u8>> = iter
             .map(|r| r.map(|(k, _)| k.to_vec()))
@@ -262,25 +262,23 @@ impl KVStore for RocksDB {
         let mut results = Vec::new();
         for key in keys_to_fetch.iter().take(limit) {
             if let Some(value) = self.db.get_cf(&cf_handle, key)? {
-                let deserialized: T = if include_keys {
-                    let inner: T = MessagePackSerializer.deserialize(&value)?;
-
-                    let key_value = KeyValuePair {
-                        key: String::from_utf8_lossy(key).into_owned(),
-                        value: inner,
-                    };
-                    MessagePackSerializer
-                        .deserialize(&MessagePackSerializer.serialize(&key_value)?)?
+                let value: T = MessagePackSerializer.deserialize(&value)?;
+                if include_keys {
+                    let key_str = String::from_utf8_lossy(key).into_owned();
+                    let kv = serde_json::from_value(serde_json::json!({
+                        "key": key_str,
+                        "value": value
+                    }))
+                    .map_err(|e| KvStoreError::SerializationError(e.to_string()))?;
+                    results.push(kv);
                 } else {
-                    MessagePackSerializer.deserialize(&value)?
-                };
-                results.push(deserialized);
+                    results.push(value);
+                }
             }
         }
 
         Ok(results)
     }
-
     fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError> {
         let cf_handle = self.cf_handle(cf)?;
 
@@ -328,63 +326,39 @@ impl KVStore for RocksDB {
         &self,
         cf: &str,
         query: &str,
+        include_keys: bool,
     ) -> Result<Vec<T>, KvStoreError> {
         let cf_handle = self
             .db
             .cf_handle(cf)
-            .ok_or(KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+            .ok_or_else(|| KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+        let path = JsonPath::try_from(query)
+            .map_err(|e| KvStoreError::InvalidQuery(format!("Invalid JSONPath: {}", e)))?;
 
-        let runtime = Runtime::new();
-        let expr = runtime
-            .compile(query)
-            .map_err(|e| KvStoreError::InvalidQuery(format!("Invalid JMESPath: {}", e)))?;
-
-        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
-        let mut results = Vec::new();
-
-        for item in iter {
-            let (_, value_bytes) = item?;
-            let value: T = MessagePackSerializer.deserialize(&value_bytes)?;
-            let value_json = serde_json::to_value(&value)
-                .map_err(|e| KvStoreError::SerializationError(e.to_string()))?;
-
-            match expr.search(&value_json) {
-                Ok(result) => {
-                    // convert Variable to bool
-                    match &*result {
-                        Variable::Bool(b) => {
-                            if *b {
-                                results.push(value)
+        Ok(self
+            .db
+            .iterator_cf(&cf_handle, IteratorMode::Start)
+            .filter_map(|item| {
+                item.ok().and_then(|(key, value_bytes)| {
+                    let value: T = MessagePackSerializer.deserialize(&value_bytes).ok()?;
+                    let value_json = serde_json::to_value(&value).ok()?;
+                    match path.find(&value_json) {
+                        json_val if !json_val.is_null() => {
+                            if include_keys {
+                                serde_json::from_value(serde_json::json!({
+                                    "key": String::from_utf8_lossy(&key),
+                                    "value": value
+                                }))
+                                .ok()
+                            } else {
+                                Some(value)
                             }
                         }
-                        Variable::Number(n) => {
-                            if n.as_f64().unwrap_or(0.0) != 0.0 {
-                                results.push(value)
-                            }
-                        }
-                        Variable::String(s) => {
-                            if !s.is_empty() {
-                                results.push(value)
-                            }
-                        }
-                        Variable::Array(a) => {
-                            if !a.is_empty() {
-                                results.push(value)
-                            }
-                        }
-                        Variable::Object(o) => {
-                            if !o.is_empty() {
-                                results.push(value)
-                            }
-                        }
-                        Variable::Null => {}
-                        Variable::Expref(_) => {} // function refs are considered falsy
+                        _ => None,
                     }
-                }
-                Err(e) => return Err(KvStoreError::InvalidQuery(format!("JMESPath error: {}", e))),
-            }
-        }
-        Ok(results)
+                })
+            })
+            .collect())
     }
     fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
         let cf_handle = self.cf_handle(cf)?;

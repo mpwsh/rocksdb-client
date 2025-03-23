@@ -1,7 +1,6 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use rocksdb_client::{Direction, KVStore, KvStoreError, Options, RocksDB};
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct User {
@@ -21,7 +20,7 @@ impl User {
         }
     }
 }
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Room {
     id: u64,
     name: String,
@@ -29,13 +28,13 @@ struct Room {
     style: MatchStyle,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Settings {
     id: u64,
     color: String,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 enum MatchStyle {
     Team,
     Dm,
@@ -174,25 +173,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Print final state
     println!("\n=== Final State after restore ===");
     print_cf_contents(&db)?;
-    println!("\nQuerying rooms where id = 2:");
-    let query = r#"{
-    "==": [{"var": "id"}, 2]
-}"#;
-    let matching_rooms: Vec<Room> = db.query_cf("rooms", query)?;
-    for room in matching_rooms {
-        println!("Found room: {:?}", room);
-    }
-
-    let complex_query = r#"{
-    "and": [
-        {">": [{"var": "id"}, 1]},
-        {"==": [{"var": "style"}, "Dm"]}
-    ]
-}"#;
-
-    println!("Finding Team rooms with id > 1 and style == Team");
-    let team_rooms: Vec<Room> = db.query_cf("rooms", complex_query)?;
-    println!("Found rooms (complex query): {team_rooms:?}");
+    print_queries(&db)?;
 
     Ok(())
 }
@@ -264,5 +245,149 @@ fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
         println!("- {:?}", room);
     }
 
+    Ok(())
+}
+
+fn print_queries(db: &RocksDB) -> Result<(), KvStoreError> {
+    // Basic root selector
+    println!("\n--- Root and Basic Selectors ---");
+
+    // Root element with wildcard
+    println!("Get all rooms (root with wildcard):");
+    let query = "$[*]";
+    let all_rooms = db.query_cf::<Room>("rooms", query, false)?;
+    println!("All rooms: {:?}", all_rooms);
+
+    // Index selectors
+    println!("\n--- Array Index Selectors ---");
+
+    // Single index
+    let query = "$[0]";
+    println!("Get room at index 0: {query}");
+    let first_room = db.query_cf::<Room>("rooms", query, false)?;
+    println!("First room: {:?}", first_room);
+
+    // Negative index (from end)
+    let query = "$[-1]";
+    println!("\nGet last room (negative index): {query}");
+    let last_room = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Last room: {:?}", last_room);
+
+    // Multiple indices
+    let query = "$[0,2]";
+    println!("\nGet rooms at specific indices (0 and 2): {query}");
+    let selected_rooms = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Selected rooms: {:?}", selected_rooms);
+
+    // Slice Operators
+    println!("\n--- Array Slice Selectors ---");
+
+    // Basic slice
+    let query = "$[0:2]";
+    println!("Get rooms from index 0 to 2 (exclusive): {query}");
+    let first_two = db.query_cf::<Room>("rooms", query, false)?;
+    println!("First two rooms: {:?}", first_two);
+
+    // Open-ended slice (from index to end)
+    let query = "$[1:]";
+    println!("\nGet rooms from index 1 to end: {query}");
+    let from_index_one = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms from index 1: {:?}", from_index_one);
+
+    // Negative start index slice
+    let query = "$[-2:]";
+    println!("\nGet last two rooms: {query}");
+    let last_two = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Last two rooms: {:?}", last_two);
+
+    // Filter Expressions
+    println!("\n--- Filter Expressions ---");
+
+    // Existence check
+    let query = "$[?@.owner]";
+    println!("Find rooms with owner property: {query}");
+    let rooms_with_owner = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms with owner: {:?}", rooms_with_owner);
+
+    // Equality filter
+    let query = "$[?@.id==2]";
+    println!("\nFind rooms with id equal to 2: {query}");
+    let room_id_2 = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms with id==2: {:?}", room_id_2);
+
+    // Inequality filter
+    let query = "$[?@.id!=2]";
+    println!("\nFind rooms with id not equal to 2: {query}");
+    let not_id_2 = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms with id!=2: {:?}", not_id_2);
+
+    // Less than filter
+    let query = "$[?@.id<3]";
+    println!("\nFind rooms with id less than 3: {query}");
+    let id_lt_3 = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms with id<3: {:?}", id_lt_3);
+
+    // Greater than filter
+    let query = "$[?@.id>1]";
+    println!("\nFind rooms with id greater than 1: {query}");
+    let id_gt_1 = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms with id>1: {:?}", id_gt_1);
+
+    // Less than or equal filter
+    let query = "$[?@.id<=2]";
+    println!("\nFind rooms with id less than or equal to 2: {query}");
+    let id_lte_2 = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms with id<=2: {:?}", id_lte_2);
+
+    // Greater than or equal filter
+    let query = "$[?@.id>=2]";
+    println!("\nFind rooms with id greater than or equal to 2: {query}");
+    let id_gte_2 = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms with id>=2: {:?}", id_gte_2);
+
+    // Logical operators
+    println!("\n--- Logical Operators ---");
+
+    // AND operator
+    let query = "$[?@.id>1&&@.style=='Team']";
+    println!("Find rooms with id > 1 AND style == Team: {query}");
+    let complex_and = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms matching AND condition: {:?}", complex_and);
+
+    // OR operator
+    let query = "$[?@.id==1||@.style=='Dm']";
+    println!("\nFind rooms with id == 1 OR style == Dm: {query}");
+    let complex_or = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms matching OR condition: {:?}", complex_or);
+
+    // NOT operator
+    let query = "$[?!(@.style=='Dm')]";
+    println!("\nFind rooms that don't have style == Dm: {query}");
+    let not_condition = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms not matching condition: {:?}", not_condition);
+
+    // Alternative to custom extensions
+    println!("\n--- Alternative to Custom Extensions ---");
+
+    // Equivalent to 'in' function
+    let query = "$[?@.id==1||@.id==3]";
+    println!("Find rooms with id equal to 1 or 3 (alternative to 'in'): {query}");
+    let in_equiv = db.query_cf::<Room>("rooms", query, false)?;
+    println!("Rooms with id in [1,3]: {:?}", in_equiv);
+
+    // Name Selectors
+    println!("\n--- Name Selectors ---");
+
+    // Direct lookup of specific property
+    let query = "$[0].name";
+    println!("Get specific room property (accessing through index then name): {query}");
+    let first_room_name = db.query_cf::<Room>("rooms", query, false)?;
+    println!("First room name: {:?}", first_room_name);
+
+    // Settings with specific property value
+    let query = "$[?@.color=='blue']";
+    println!("\nFind settings with color = 'blue': {query}");
+    let blue_settings = db.query_cf::<Settings>("settings", query, false)?;
+    println!("Blue settings: {:?}", blue_settings);
     Ok(())
 }

@@ -79,7 +79,7 @@ async fn run_query_benchmark(db: Arc<RocksDB>, num_rooms: usize) -> Result<(), K
         println!("\nRunning query: {}", description);
         let start = Instant::now();
 
-        let matching_rooms: Vec<Room> = db.query_cf("rooms", query)?;
+        let matching_rooms: Vec<Room> = db.query_cf("rooms", query, true)?;
         let duration = start.elapsed();
 
         let result = QueryBenchmarkResults {

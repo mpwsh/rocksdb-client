@@ -71,7 +71,6 @@ fn generate_complex_data(id: &str) -> ComplexTestData {
 
 #[derive(Debug)]
 struct BenchResults {
-    total_ops: usize,
     total_duration: Duration,
     throughput: f64,
     read_latencies: Vec<Duration>,
@@ -127,7 +126,6 @@ async fn run_mixed_workload(db: Arc<RocksDB>, total_ops: usize, read_ratio: f64)
     }
 
     BenchResults {
-        total_ops,
         total_duration: start.elapsed(),
         throughput: total_ops as f64 / start.elapsed().as_secs_f64(),
         read_latencies,

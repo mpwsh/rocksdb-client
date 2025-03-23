@@ -359,9 +359,9 @@ dependencies = [
 
 [[package]]
 name = "jsonpath-rust"
-version = "0.7.5"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c00ae348f9f8fd2d09f82a98ca381c60df9e0820d8d79fce43e649b4dc3128b"
+checksum = "9b0231bb404a6cd6c8f0ab41b907049063a089fc02aa7636cc5cd9a4d87364c9"
 dependencies = [
  "pest",
  "pest_derive",
@@ -763,7 +763,7 @@ dependencies = [
 
 [[package]]
 name = "rocksdb-client"
-version = "0.1.64"
+version = "0.1.65"
 dependencies = [
  "bytes",
  "futures",

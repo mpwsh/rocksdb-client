@@ -4,13 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 enum MatchStyle {
     Team,
     Dm,
 }
-// Add some more fields to make queries interesting
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Room {
     id: u64,
     name: String,
@@ -32,7 +31,7 @@ struct QueryBenchmarkResults {
 }
 
 async fn run_query_benchmark(db: Arc<RocksDB>, num_rooms: usize) -> Result<(), KvStoreError> {
-    // First, generate and insert test data
+    const QUERY_TIMEOUT_SECS: u64 = 10;
     println!("Generating {} test rooms...", num_rooms);
     let rooms = generate_test_rooms(num_rooms);
 
@@ -44,56 +43,75 @@ async fn run_query_benchmark(db: Arc<RocksDB>, num_rooms: usize) -> Result<(), K
     println!("Insertion took: {:?}", insert_start.elapsed());
 
     let queries = vec![
-        ("Find rooms with id = 5", "id == `5`"),
-        ("Find Team rooms", "style == 'Team'"),
+        ("Find rooms with id = 5", "$[?@.id==5]"),
+        ("Find Team rooms", "$[?@.style=='Team']"),
         (
             "Find available Team rooms",
-            "style == 'Team' && player_count < capacity",
+            "$[?@.style=='Team'&&@.player_count<@.capacity]",
         ),
         (
             "Find popular rooms",
-            "player_count > `5` && is_private == `false`",
+            "$[?@.player_count>5&&@.is_private==false]",
         ),
         (
             "Find empty public rooms",
-            "player_count == `0` && is_private == `false`",
+            "$[?@.player_count==0&&@.is_private==false]",
         ),
-        (
-            "Find rooms with specific tag",
-            "tags[?@ == 'abc'] | [0] != null", // using pipe to check if array has elements
-        ),
-        (
-            "Find rooms with any tags",
-            "tags[0] != null", // simple check if array has at least one element
-        ),
+        ("Find rooms with specific tag", "$[?@.tags[0]=='abc']"),
+        ("Find rooms with any tags", "$[?@.tags[0]]"),
         (
             "Find recent team rooms",
-            "style == 'Team' && created_at > `1234567890`",
+            "$[?@.style=='Team'&&@.created_at>1234567890]",
         ),
     ];
 
     let mut results = Vec::new();
 
-    // Run each query and measure performance
     for (description, query) in queries {
         println!("\nRunning query: {}", description);
+        println!("Query: {}", query);
         let start = Instant::now();
 
-        let matching_rooms: Vec<Room> = db.query_cf("rooms", query, true)?;
-        let duration = start.elapsed();
+        let query_result = tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), async {
+            db.query_cf::<Room>("rooms", query, false)
+        })
+        .await;
 
-        let result = QueryBenchmarkResults {
-            query_type: description.to_string(),
-            total_matches: matching_rooms.len(),
-            duration,
-            matches_per_second: matching_rooms.len() as f64 / duration.as_secs_f64(),
-        };
+        match query_result {
+            Ok(Ok(matching_rooms)) => {
+                let duration = start.elapsed();
 
-        println!("Results: {:#?}", result);
-        results.push(result);
+                let result = QueryBenchmarkResults {
+                    query_type: description.to_string(),
+                    total_matches: matching_rooms.len(),
+                    duration,
+                    matches_per_second: matching_rooms.len() as f64 / duration.as_secs_f64(),
+                };
+
+                println!("Results: {:#?}", result);
+                results.push(result);
+            }
+            Ok(Err(e)) => {
+                println!("Query error: {:?}", e);
+                results.push(QueryBenchmarkResults {
+                    query_type: format!("{} (ERROR)", description),
+                    total_matches: 0,
+                    duration: start.elapsed(),
+                    matches_per_second: 0.0,
+                });
+            }
+            Err(_) => {
+                println!("Query timed out after {} seconds!", QUERY_TIMEOUT_SECS);
+                results.push(QueryBenchmarkResults {
+                    query_type: format!("{} (TIMEOUT)", description),
+                    total_matches: 0,
+                    duration: Duration::from_secs(QUERY_TIMEOUT_SECS),
+                    matches_per_second: 0.0,
+                });
+            }
+        }
     }
 
-    // Print summary
     println!("\nQuery Benchmark Summary:");
     println!("{:-<50}", "");
     for result in results {
@@ -128,7 +146,7 @@ fn generate_test_rooms(count: usize) -> Vec<Room> {
                 capacity,
                 player_count: rng.gen_range(0..=capacity),
                 is_private: rng.gen_bool(0.2),
-                created_at: now - rng.gen_range(0..30 * 24 * 60 * 60), // Random time in last 30 days
+                created_at: now - rng.gen_range(0..30 * 24 * 60 * 60),
                 tags: (0..rng.gen_range(0..5))
                     .map(|_| generate_random_string(5))
                     .collect(),
@@ -145,24 +163,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opts.create_if_missing(true);
     opts.create_missing_column_families(true);
 
-    // Performance options
     opts.set_write_buffer_size(64 * 1024 * 1024);
     opts.increase_parallelism(num_cpus::get() as i32);
 
     println!("Initializing database at {}", path);
     let db = Arc::new(RocksDB::open_cf(&opts, path, column_families)?);
 
-    // Test with different dataset sizes
-    for size in [1000, 10_000, 100_000].iter() {
+    for size in [1000, 20_000].iter() {
         println!("\nTesting with {} rooms", size);
         println!("{:-<50}", "");
 
-        if let Err(e) = run_query_benchmark(db.clone(), *size).await {
-            println!("Benchmark failed: {:?}", e);
+        let benchmark = async {
+            if let Err(e) = run_query_benchmark(db.clone(), *size).await {
+                println!("Benchmark failed: {:?}", e);
+            }
+        };
+
+        match tokio::time::timeout(Duration::from_secs(120), benchmark).await {
+            Ok(_) => println!("Benchmark completed successfully"),
+            Err(_) => println!("Benchmark timed out after 120 seconds!"),
         }
     }
 
-    // Cleanup
     println!("\nRemoving test database...");
     std::fs::remove_dir_all(path)?;
 

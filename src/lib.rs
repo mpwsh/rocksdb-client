@@ -73,6 +73,21 @@ pub trait KVStore: Sized {
     fn cf_exists(&self, name: &str) -> bool;
     fn insert_cf<T: Serialize>(&self, cf: &str, key: &str, value: &T) -> Result<(), KvStoreError>;
     fn get_cf<T: DeserializeOwned>(&self, cf: &str, key: &str) -> Result<T, KvStoreError>;
+    fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError>;
+    fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError>;
+    fn get_cf_size(&self, cf: &str) -> Result<CFSize, KvStoreError>;
+    fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
+    fn restore_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
+    fn query_cf<T: DeserializeOwned + Serialize>(
+        &self,
+        cf: &str,
+        query: &str,
+    ) -> Result<Vec<T>, KvStoreError>;
+    fn query_cf_with_keys<T: DeserializeOwned + Serialize>(
+        &self,
+        cf: &str,
+        query: &str,
+    ) -> Result<Vec<KeyValuePair<T>>, KvStoreError>;
     fn get_range_cf<T: DeserializeOwned + Serialize>(
         &self,
         cf: &str,
@@ -80,19 +95,15 @@ pub trait KVStore: Sized {
         to: &str,
         limit: usize,
         direction: Direction,
-        include_keys: bool,
     ) -> Result<Vec<T>, KvStoreError>;
-    fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError>;
-    fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError>;
-    fn get_cf_size(&self, cf: &str) -> Result<CFSize, KvStoreError>;
-    fn query_cf<T: DeserializeOwned + Serialize + Clone>(
+    fn get_range_cf_with_keys<T: DeserializeOwned + Serialize>(
         &self,
         cf: &str,
-        query: &str,
-        include_keys: bool,
-    ) -> Result<Vec<T>, KvStoreError>;
-    fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
-    fn restore_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
+        from: &str,
+        to: &str,
+        limit: usize,
+        direction: Direction,
+    ) -> Result<Vec<KeyValuePair<T>>, KvStoreError>;
 }
 
 #[derive(Clone)]
@@ -230,55 +241,6 @@ impl KVStore for RocksDB {
         MessagePackSerializer.deserialize(&value)
     }
 
-    fn get_range_cf<T: DeserializeOwned + Serialize>(
-        &self,
-        cf: &str,
-        from: &str,
-        to: &str,
-        limit: usize,
-        direction: Direction,
-        include_keys: bool,
-    ) -> Result<Vec<T>, KvStoreError> {
-        let cf_handle = self.cf_handle(cf)?;
-        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
-        let all_keys: Vec<Vec<u8>> = iter
-            .map(|r| r.map(|(k, _)| k.to_vec()))
-            .collect::<Result<_, _>>()?;
-
-        let from_idx = from.parse::<usize>().unwrap_or(0);
-        let to_idx = to.parse::<usize>().unwrap_or(all_keys.len());
-        let from_idx = from_idx.min(all_keys.len());
-        let to_idx = (to_idx + 1).min(all_keys.len());
-
-        let keys_to_fetch = match direction {
-            Direction::Forward => all_keys[from_idx..to_idx].to_vec(),
-            Direction::Reverse => {
-                let mut keys = all_keys[from_idx..to_idx].to_vec();
-                keys.reverse();
-                keys
-            }
-        };
-
-        let mut results = Vec::new();
-        for key in keys_to_fetch.iter().take(limit) {
-            if let Some(value) = self.db.get_cf(&cf_handle, key)? {
-                let value: T = MessagePackSerializer.deserialize(&value)?;
-                if include_keys {
-                    let key_str = String::from_utf8_lossy(key).into_owned();
-                    let kv = serde_json::from_value(serde_json::json!({
-                        "key": key_str,
-                        "value": value
-                    }))
-                    .map_err(|e| KvStoreError::SerializationError(e.to_string()))?;
-                    results.push(kv);
-                } else {
-                    results.push(value);
-                }
-            }
-        }
-
-        Ok(results)
-    }
     fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError> {
         let cf_handle = self.cf_handle(cf)?;
 
@@ -322,72 +284,6 @@ impl KVStore for RocksDB {
             blob_bytes: blob_size,
         })
     }
-    fn query_cf<T: DeserializeOwned + Serialize + Clone>(
-        &self,
-        cf: &str,
-        query: &str,
-        include_keys: bool,
-    ) -> Result<Vec<T>, KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or_else(|| KvStoreError::InvalidColumnFamily(cf.to_string()))?;
-
-        // Get all documents from the column family
-        let mut all_docs = Vec::new();
-        for item in self.db.iterator_cf(&cf_handle, IteratorMode::Start) {
-            if let Ok((key, value_bytes)) = item {
-                if let Ok(value) = MessagePackSerializer.deserialize::<T>(&value_bytes) {
-                    all_docs.push((key.to_vec(), value));
-                }
-            }
-        }
-
-        // Create a JSON array containing all documents for proper querying
-        let json_docs: Vec<serde_json::Value> = all_docs
-            .iter()
-            .map(|(_, value)| serde_json::to_value(value).unwrap_or(serde_json::Value::Null))
-            .collect();
-
-        let json_array = serde_json::Value::Array(json_docs.clone());
-
-        // Run the JSONPath query on the array
-        let results = match json_array.query(query) {
-            Ok(matches) => matches,
-            Err(e) => return Err(KvStoreError::InvalidQuery(format!("JSONPath error: {}", e))),
-        };
-
-        // Transform results back to the original type
-        let mut final_results = Vec::new();
-        for result in results {
-            // Find the matching document by comparing serialized JSON values
-            for (idx, doc_value) in json_docs.iter().enumerate() {
-                if result == doc_value {
-                    let (key, value) = &all_docs[idx];
-
-                    if include_keys {
-                        // Create a KeyValuePair structure with key and value
-                        let key_str = String::from_utf8_lossy(key).to_string();
-                        let kv_json = serde_json::json!({
-                            "key": key_str,
-                            "value": value
-                        });
-
-                        if let Ok(typed_kv) = serde_json::from_value::<T>(kv_json) {
-                            final_results.push(typed_kv);
-                        }
-                    } else {
-                        // Just add the value directly
-                        final_results.push(value.clone());
-                    }
-
-                    break;
-                }
-            }
-        }
-
-        Ok(final_results)
-    }
 
     fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
         let cf_handle = self.cf_handle(cf)?;
@@ -426,5 +322,206 @@ impl KVStore for RocksDB {
             .ingest_external_file_cf_opts(&cf_handle, &ingest_opts, vec![path])?;
 
         Ok(())
+    }
+    fn query_cf<T: DeserializeOwned + Serialize>(
+        &self,
+        cf: &str,
+        query: &str,
+    ) -> Result<Vec<T>, KvStoreError> {
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+
+        // Collect all document data
+        let mut documents = Vec::new();
+        let mut json_values = Vec::new();
+
+        // Single pass collection of data
+        for item in self.db.iterator_cf(&cf_handle, IteratorMode::Start) {
+            let (_, value_bytes) = item?;
+            let value: T = MessagePackSerializer.deserialize(&value_bytes)?;
+
+            // Convert to JSON for querying only once
+            let json_value = serde_json::to_value(&value)
+                .map_err(|e| KvStoreError::SerializationError(e.to_string()))?;
+
+            documents.push(value);
+            json_values.push(json_value);
+        }
+
+        // Create JSON array and run query
+        let json_array = serde_json::Value::Array(json_values.clone());
+
+        let matches = match json_array.query(query) {
+            Ok(m) => m,
+            Err(e) => return Err(KvStoreError::InvalidQuery(format!("JSONPath error: {}", e))),
+        };
+
+        // Build result set by taking ownership of matching values
+        let mut final_results = Vec::with_capacity(matches.len());
+
+        for matched_value in matches {
+            for (i, json_value) in json_values.iter().enumerate() {
+                if matched_value == json_value {
+                    // Take ownership of the value using swap_remove - O(1) operation
+                    final_results.push(documents.swap_remove(i));
+                    json_values.swap_remove(i);
+                    break;
+                }
+            }
+        }
+
+        Ok(final_results)
+    }
+
+    // Query implementation with key-value pairs
+    fn query_cf_with_keys<T: DeserializeOwned + Serialize>(
+        &self,
+        cf: &str,
+        query: &str,
+    ) -> Result<Vec<KeyValuePair<T>>, KvStoreError> {
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| KvStoreError::InvalidColumnFamily(cf.to_string()))?;
+
+        // Collect all document data with keys
+        let mut documents_with_keys = Vec::new();
+        let mut json_values = Vec::new();
+
+        // Single pass collection of data
+        for item in self.db.iterator_cf(&cf_handle, IteratorMode::Start) {
+            let (key, value_bytes) = item?;
+            let value: T = MessagePackSerializer.deserialize(&value_bytes)?;
+
+            // Convert to JSON for querying only once
+            let json_value = serde_json::to_value(&value)
+                .map_err(|e| KvStoreError::SerializationError(e.to_string()))?;
+
+            documents_with_keys.push((key.to_vec(), value));
+            json_values.push(json_value);
+        }
+
+        // Create JSON array and run query
+        let json_array = serde_json::Value::Array(json_values.clone());
+
+        let matches = match json_array.query(query) {
+            Ok(m) => m,
+            Err(e) => return Err(KvStoreError::InvalidQuery(format!("JSONPath error: {}", e))),
+        };
+
+        // Build result set by taking ownership of matching values
+        let mut final_results = Vec::with_capacity(matches.len());
+
+        for matched_value in matches {
+            for (i, json_value) in json_values.iter().enumerate() {
+                if matched_value == json_value {
+                    // Get key and value
+                    let (key, value) = documents_with_keys.swap_remove(i);
+
+                    // Convert key to string
+                    let key_str = String::from_utf8_lossy(&key).into_owned();
+
+                    // Create a KeyValuePair directly
+                    final_results.push(KeyValuePair {
+                        key: key_str,
+                        value,
+                    });
+
+                    // Remove from json values to avoid duplicate matches
+                    json_values.swap_remove(i);
+                    break;
+                }
+            }
+        }
+
+        Ok(final_results)
+    }
+
+    // Values-only range implementation
+    fn get_range_cf<T: DeserializeOwned + Serialize>(
+        &self,
+        cf: &str,
+        from: &str,
+        to: &str,
+        limit: usize,
+        direction: Direction,
+    ) -> Result<Vec<T>, KvStoreError> {
+        let cf_handle = self.cf_handle(cf)?;
+        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
+        let all_keys: Vec<Vec<u8>> = iter
+            .map(|r| r.map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+
+        let from_idx = from.parse::<usize>().unwrap_or(0);
+        let to_idx = to.parse::<usize>().unwrap_or(all_keys.len());
+        let from_idx = from_idx.min(all_keys.len());
+        let to_idx = (to_idx + 1).min(all_keys.len());
+
+        let keys_to_fetch = match direction {
+            Direction::Forward => all_keys[from_idx..to_idx].to_vec(),
+            Direction::Reverse => {
+                let mut keys = all_keys[from_idx..to_idx].to_vec();
+                keys.reverse();
+                keys
+            }
+        };
+
+        let mut results = Vec::with_capacity(limit.min(keys_to_fetch.len()));
+        for key in keys_to_fetch.iter().take(limit) {
+            if let Some(value) = self.db.get_cf(&cf_handle, key)? {
+                let value: T = MessagePackSerializer.deserialize(&value)?;
+                results.push(value);
+            }
+        }
+
+        Ok(results)
+    }
+
+    // Range implementation with key-value pairs
+    fn get_range_cf_with_keys<T: DeserializeOwned + Serialize>(
+        &self,
+        cf: &str,
+        from: &str,
+        to: &str,
+        limit: usize,
+        direction: Direction,
+    ) -> Result<Vec<KeyValuePair<T>>, KvStoreError> {
+        let cf_handle = self.cf_handle(cf)?;
+        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
+        let all_keys: Vec<Vec<u8>> = iter
+            .map(|r| r.map(|(k, _)| k.to_vec()))
+            .collect::<Result<_, _>>()?;
+
+        let from_idx = from.parse::<usize>().unwrap_or(0);
+        let to_idx = to.parse::<usize>().unwrap_or(all_keys.len());
+        let from_idx = from_idx.min(all_keys.len());
+        let to_idx = (to_idx + 1).min(all_keys.len());
+
+        let keys_to_fetch = match direction {
+            Direction::Forward => all_keys[from_idx..to_idx].to_vec(),
+            Direction::Reverse => {
+                let mut keys = all_keys[from_idx..to_idx].to_vec();
+                keys.reverse();
+                keys
+            }
+        };
+
+        let mut results = Vec::with_capacity(limit.min(keys_to_fetch.len()));
+        for key in keys_to_fetch.iter().take(limit) {
+            if let Some(value) = self.db.get_cf(&cf_handle, key)? {
+                let value: T = MessagePackSerializer.deserialize(&value)?;
+                let key_str = String::from_utf8_lossy(key).into_owned();
+
+                // Create a KeyValuePair directly
+                results.push(KeyValuePair {
+                    key: key_str,
+                    value,
+                });
+            }
+        }
+
+        Ok(results)
     }
 }

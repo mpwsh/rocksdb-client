@@ -43,6 +43,45 @@ async fn run_query_benchmark(db: Arc<RocksDB>, num_rooms: usize) -> Result<(), K
     println!("Insertion took: {:?}", insert_start.elapsed());
 
     let queries = vec![
+        ("Get all rooms", "$[*]"),
+        ("Get room at index 0", "$[0]"),
+        ("Get last room (negative index)", "$[-1]"),
+        ("Get rooms at specific indices (0 and 2)", "$[0,2]"),
+        // Array Slice Selectors
+        ("Get rooms from index 0 to 2 (exclusive)", "$[0:2]"),
+        ("Get rooms from index 1 to end", "$[1:]"),
+        ("Get last two rooms", "$[-2:]"),
+        // Filter Expressions
+        ("Find rooms with owner property", "$[?@.owner]"),
+        ("Find rooms with id equal to 2", "$[?@.id==2]"),
+        ("Find rooms with id not equal to 2", "$[?@.id!=2]"),
+        ("Find rooms with id less than 3", "$[?@.id<3]"),
+        ("Find rooms with id greater than 1", "$[?@.id>1]"),
+        ("Find rooms with id less than or equal to 2", "$[?@.id<=2]"),
+        (
+            "Find rooms with id greater than or equal to 2",
+            "$[?@.id>=2]",
+        ),
+        // Logical Operators
+        (
+            "Find rooms with id > 1 AND style == Team",
+            "$[?@.id>1&&@.style=='Team']",
+        ),
+        (
+            "Find rooms with id == 1 OR style == Dm",
+            "$[?@.id==1||@.style=='Dm']",
+        ),
+        (
+            "Find rooms that don't have style == Dm",
+            "$[?!(@.style=='Dm')]",
+        ),
+        ("Find rooms with id equal to 1 or 3", "$[?@.id==1||@.id==3]"),
+        // Property Selectors
+        (
+            "Get specific room property (name of first room)",
+            "$[0].name",
+        ),
+        ("Find settings with color = 'blue'", "$[?@.color=='blue']"),
         ("Find rooms with id = 5", "$[?@.id==5]"),
         ("Find Team rooms", "$[?@.style=='Team']"),
         (
@@ -65,35 +104,43 @@ async fn run_query_benchmark(db: Arc<RocksDB>, num_rooms: usize) -> Result<(), K
         ),
     ];
 
-    let mut results = Vec::new();
+    // Store results for values-only and key-value queries
+    let mut value_only_results = Vec::new();
+    let mut key_value_results = Vec::new();
 
+    // Run both types of queries for each test case
     for (description, query) in queries {
-        println!("\nRunning query: {}", description);
-        println!("Query: {}", query);
-        let start = Instant::now();
+        println!("\n{:-<50}", "");
+        println!("Query: {} - {}", description, query);
+        println!("{:-<50}", "");
 
+        // Run values-only query
+        println!("\nRunning without keys (query_cf)...");
+        let start = Instant::now();
         let query_result = tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), async {
-            db.query_cf::<Room>("rooms", query, false)
+            db.query_cf::<Room>("rooms", query)
         })
         .await;
 
         match query_result {
             Ok(Ok(matching_rooms)) => {
                 let duration = start.elapsed();
-
                 let result = QueryBenchmarkResults {
                     query_type: description.to_string(),
                     total_matches: matching_rooms.len(),
                     duration,
                     matches_per_second: matching_rooms.len() as f64 / duration.as_secs_f64(),
                 };
-
-                println!("Results: {:#?}", result);
-                results.push(result);
+                println!(
+                    "Values-only results: {} matches in {:?}",
+                    matching_rooms.len(),
+                    duration
+                );
+                value_only_results.push(result);
             }
             Ok(Err(e)) => {
                 println!("Query error: {:?}", e);
-                results.push(QueryBenchmarkResults {
+                value_only_results.push(QueryBenchmarkResults {
                     query_type: format!("{} (ERROR)", description),
                     total_matches: 0,
                     duration: start.elapsed(),
@@ -102,7 +149,51 @@ async fn run_query_benchmark(db: Arc<RocksDB>, num_rooms: usize) -> Result<(), K
             }
             Err(_) => {
                 println!("Query timed out after {} seconds!", QUERY_TIMEOUT_SECS);
-                results.push(QueryBenchmarkResults {
+                value_only_results.push(QueryBenchmarkResults {
+                    query_type: format!("{} (TIMEOUT)", description),
+                    total_matches: 0,
+                    duration: Duration::from_secs(QUERY_TIMEOUT_SECS),
+                    matches_per_second: 0.0,
+                });
+            }
+        }
+
+        // Run key-value query
+        println!("\nRunning with keys (query_cf_with_keys)...");
+        let start = Instant::now();
+        let query_result = tokio::time::timeout(Duration::from_secs(QUERY_TIMEOUT_SECS), async {
+            db.query_cf_with_keys::<Room>("rooms", query)
+        })
+        .await;
+
+        match query_result {
+            Ok(Ok(matching_rooms)) => {
+                let duration = start.elapsed();
+                let result = QueryBenchmarkResults {
+                    query_type: description.to_string(),
+                    total_matches: matching_rooms.len(),
+                    duration,
+                    matches_per_second: matching_rooms.len() as f64 / duration.as_secs_f64(),
+                };
+                println!(
+                    "Key-value results: {} matches in {:?}",
+                    matching_rooms.len(),
+                    duration
+                );
+                key_value_results.push(result);
+            }
+            Ok(Err(e)) => {
+                println!("Query error: {:?}", e);
+                key_value_results.push(QueryBenchmarkResults {
+                    query_type: format!("{} (ERROR)", description),
+                    total_matches: 0,
+                    duration: start.elapsed(),
+                    matches_per_second: 0.0,
+                });
+            }
+            Err(_) => {
+                println!("Query timed out after {} seconds!", QUERY_TIMEOUT_SECS);
+                key_value_results.push(QueryBenchmarkResults {
                     query_type: format!("{} (TIMEOUT)", description),
                     total_matches: 0,
                     duration: Duration::from_secs(QUERY_TIMEOUT_SECS),
@@ -112,15 +203,55 @@ async fn run_query_benchmark(db: Arc<RocksDB>, num_rooms: usize) -> Result<(), K
         }
     }
 
-    println!("\nQuery Benchmark Summary:");
+    // Print comparison summary
+    println!("\n{:=<80}", "");
+    println!("QUERY PERFORMANCE COMPARISON SUMMARY");
+    println!("{:=<80}", "");
+    println!(
+        "{:<30} | {:<20} | {:<20} | {:<10}",
+        "Query", "Values-Only Time", "With Keys Time", "% Diff"
+    );
+    println!("{:-<80}", "");
+
+    for (i, value_result) in value_only_results.iter().enumerate() {
+        if i < key_value_results.len() {
+            let key_result = &key_value_results[i];
+
+            // Calculate performance difference as percentage
+            let value_time = value_result.duration.as_secs_f64() * 1000.0; // ms
+            let key_time = key_result.duration.as_secs_f64() * 1000.0; // ms
+
+            let percent_diff = if value_time > 0.0 {
+                ((key_time - value_time) / value_time * 100.0).round()
+            } else {
+                0.0
+            };
+
+            println!(
+                "{:<30} | {:<20.2?} | {:<20.2?} | {:<+10.1}%",
+                value_result.query_type, value_result.duration, key_result.duration, percent_diff
+            );
+        }
+    }
+
+    println!("\nDetailed Results:");
+    println!("\nValues-Only Queries:");
     println!("{:-<50}", "");
-    for result in results {
+    for result in value_only_results {
         println!(
             "{}\n\tMatches: {}\n\tDuration: {:?}\n\tMatches/sec: {:.2}",
             result.query_type, result.total_matches, result.duration, result.matches_per_second
         );
     }
 
+    println!("\nKey-Value Queries:");
+    println!("{:-<50}", "");
+    for result in key_value_results {
+        println!(
+            "{}\n\tMatches: {}\n\tDuration: {:?}\n\tMatches/sec: {:.2}",
+            result.query_type, result.total_matches, result.duration, result.matches_per_second
+        );
+    }
     Ok(())
 }
 

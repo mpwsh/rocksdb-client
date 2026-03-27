@@ -1,7 +1,7 @@
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use jsonpath_rust::JsonPath;
-pub use rocksdb::{ColumnFamilyDescriptor, DBCompressionType, Direction, Options};
+pub use rocksdb::{ColumnFamilyDescriptor, ColumnFamilyTtl, DBCompressionType, Direction, Options};
 use rocksdb::{IngestExternalFileOptions, IteratorMode, SstFileWriter, WriteBatch, DB};
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -40,7 +40,18 @@ impl CFSize {
     }
 }
 
-// --- Database ---
+/// Metadata for a column family's TTL configuration.
+/// Stored as JSON in the secrets CF under `_cf_meta:{cf_name}`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CfMetadata {
+    /// TTL in seconds. 0 means disabled (no expiry).
+    pub ttl_secs: u64,
+    /// Unix timestamp when this CF was created.
+    #[serde(default)]
+    pub created_at: Option<u64>,
+}
+
+const CF_META_PREFIX: &str = "_cf_meta:";
 
 #[derive(Clone)]
 pub struct RocksDB {
@@ -454,5 +465,197 @@ impl RocksDB {
         self.db
             .ingest_external_file_cf_opts(&cf_handle, &ingest_opts, vec![path])?;
         Ok(())
+    }
+}
+
+impl CfMetadata {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl_secs: ttl.as_secs(),
+            created_at: Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
+        }
+    }
+
+    pub fn to_cf_ttl(&self) -> ColumnFamilyTtl {
+        if self.ttl_secs == 0 {
+            ColumnFamilyTtl::Disabled
+        } else {
+            ColumnFamilyTtl::Duration(Duration::from_secs(self.ttl_secs))
+        }
+    }
+}
+
+// ── CF metadata persistence ──────────────────────────────────────────────────
+
+impl RocksDB {
+    /// Store CF metadata in the given meta CF (e.g. "secrets").
+    pub fn store_cf_metadata(
+        &self,
+        meta_cf: &str,
+        cf_name: &str,
+        meta: &CfMetadata,
+    ) -> Result<(), KvStoreError> {
+        let key = format!("{CF_META_PREFIX}{cf_name}");
+        let cf_handle = self.cf_handle(meta_cf)?;
+        let bytes = serialize(meta)?;
+        self.db
+            .put_cf(&cf_handle, key.as_bytes(), bytes)
+            .map_err(Into::into)
+    }
+
+    /// Load CF metadata from the meta CF.
+    pub fn load_cf_metadata(
+        &self,
+        meta_cf: &str,
+        cf_name: &str,
+    ) -> Result<Option<CfMetadata>, KvStoreError> {
+        let key = format!("{CF_META_PREFIX}{cf_name}");
+        let cf_handle = self.cf_handle(meta_cf)?;
+        match self.db.get_cf(&cf_handle, key.as_bytes())? {
+            Some(bytes) => Ok(Some(deserialize(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Load all CF metadata entries from the meta CF.
+    pub fn load_all_cf_metadata(
+        &self,
+        meta_cf: &str,
+    ) -> Result<HashMap<String, CfMetadata>, KvStoreError> {
+        let cf_handle = self.cf_handle(meta_cf)?;
+        let prefix = CF_META_PREFIX.as_bytes();
+        let mut result = HashMap::new();
+
+        for item in self.db.iterator_cf(&cf_handle, IteratorMode::Start) {
+            let (key_bytes, val_bytes) = item?;
+            let key = String::from_utf8_lossy(&key_bytes);
+            if let Some(cf_name) = key.strip_prefix(CF_META_PREFIX) {
+                if let Ok(meta) = deserialize::<CfMetadata>(&val_bytes) {
+                    result.insert(cf_name.to_string(), meta);
+                }
+            }
+            // Since iterator is sorted and our prefix starts with '_',
+            // we can break once we pass the prefix range
+            if key_bytes.len() >= prefix.len() && &key_bytes[..prefix.len()] > prefix {
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    /// Delete CF metadata from the meta CF.
+    pub fn delete_cf_metadata(&self, meta_cf: &str, cf_name: &str) -> Result<(), KvStoreError> {
+        let key = format!("{CF_META_PREFIX}{cf_name}");
+        self.delete_cf(meta_cf, &key)
+    }
+}
+
+// ── TTL-aware open ───────────────────────────────────────────────────────────
+
+impl RocksDB {
+    /// Open the database with per-CF TTL from saved metadata.
+    ///
+    /// Two-phase open:
+    ///   1. Open all existing CFs with TTL disabled → read metadata from `meta_cf`
+    ///   2. Close → reopen with correct per-CF TTLs
+    ///
+    /// `system_cfs` (e.g. "secrets", "backups", "restores") always get
+    /// `ColumnFamilyTtl::Disabled`.
+    pub fn open_with_ttl_metadata<P: AsRef<Path>>(
+        opts: &Options,
+        path: P,
+        meta_cf: &str,
+        system_cfs: &[&str],
+    ) -> Result<Self, KvStoreError> {
+        let db_path = path.as_ref();
+
+        // Discover existing CFs
+        let cf_names = if db_path.join("CURRENT").exists() {
+            Self::list_cf(db_path)?
+        } else {
+            if !db_path.exists() {
+                std::fs::create_dir_all(db_path)?;
+            }
+            vec!["default".to_string()]
+        };
+
+        // Phase 1: Open everything with TTL disabled to read metadata
+        let phase1_descriptors: Vec<ColumnFamilyDescriptor> = cf_names
+            .iter()
+            .map(|name| {
+                ColumnFamilyDescriptor::new_with_ttl(
+                    name.as_str(),
+                    Options::default(),
+                    ColumnFamilyTtl::Disabled,
+                )
+            })
+            .collect();
+
+        let temp_db =
+            DB::open_cf_descriptors_with_ttl(opts, db_path, phase1_descriptors, Duration::ZERO)?;
+        let temp = Self {
+            db: Arc::new(temp_db),
+        };
+
+        // Ensure meta CF exists
+        if !temp.cf_exists(meta_cf) {
+            temp.create_cf(meta_cf)?;
+        }
+
+        // Read all CF metadata
+        let cf_metadata = temp.load_all_cf_metadata(meta_cf).unwrap_or_default();
+
+        // Drop phase 1 handle
+        drop(temp);
+
+        // Phase 2: Reopen with correct per-CF TTLs
+        let cf_names = Self::list_cf(db_path)?;
+
+        let descriptors: Vec<ColumnFamilyDescriptor> = cf_names
+            .iter()
+            .map(|name| {
+                let ttl = if name == "default" || system_cfs.contains(&name.as_str()) {
+                    ColumnFamilyTtl::Disabled
+                } else if let Some(meta) = cf_metadata.get(name.as_str()) {
+                    meta.to_cf_ttl()
+                } else {
+                    ColumnFamilyTtl::Disabled
+                };
+                ColumnFamilyDescriptor::new_with_ttl(name.as_str(), Options::default(), ttl)
+            })
+            .collect();
+
+        let db = DB::open_cf_descriptors_with_ttl(opts, db_path, descriptors, Duration::ZERO)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Create a new CF with TTL and persist metadata.
+    /// The per-CF TTL takes effect on next restart (RocksDB limitation).
+    pub fn create_cf_with_ttl_meta(
+        &self,
+        meta_cf: &str,
+        cf_name: &str,
+        ttl: Duration,
+    ) -> Result<(), KvStoreError> {
+        let meta = CfMetadata::new(ttl);
+        self.store_cf_metadata(meta_cf, cf_name, &meta)?;
+
+        if ttl.is_zero() {
+            self.create_cf(cf_name)?;
+        } else {
+            self.create_cf_with_ttl(cf_name, ttl.as_secs())?;
+        }
+        Ok(())
+    }
+
+    /// Drop a CF and clean up its metadata.
+    pub fn drop_cf_with_meta(&self, meta_cf: &str, cf_name: &str) -> Result<(), KvStoreError> {
+        let _ = self.delete_cf_metadata(meta_cf, cf_name);
+        self.drop_cf(cf_name)
     }
 }

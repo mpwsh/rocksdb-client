@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use jsonpath_rust::JsonPath;
 pub use rocksdb::{ColumnFamilyDescriptor, DBCompressionType, Direction, Options};
@@ -68,9 +68,43 @@ impl RocksDB {
         N: AsRef<str>,
     {
         let cf_names: Vec<String> = cfs.into_iter().map(|n| n.as_ref().to_string()).collect();
-        Ok(Self {
-            db: Arc::new(DB::open_cf(opts, path, cf_names)?),
-        })
+        let db = DB::open_cf(opts, path, cf_names)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Open with a default TTL applied to all column families.
+    /// RocksDB internally appends a timestamp to each value and removes
+    /// expired entries during compaction.
+    pub fn open_cf_with_ttl<P, I, N>(
+        opts: &Options,
+        path: P,
+        cfs: I,
+        ttl: Duration,
+    ) -> Result<Self, KvStoreError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = N>,
+        N: AsRef<str>,
+    {
+        let cf_names: Vec<String> = cfs.into_iter().map(|n| n.as_ref().to_string()).collect();
+        let db = DB::open_cf_with_ttl(opts, path, cf_names, ttl)?;
+        Ok(Self { db: Arc::new(db) })
+    }
+
+    /// Open with per-column-family TTL control via descriptors.
+    /// Use `ColumnFamilyDescriptor::new_with_ttl` to set TTL per CF.
+    pub fn open_cf_descriptors_with_ttl<P, I>(
+        opts: &Options,
+        path: P,
+        cfs: I,
+        default_ttl: Duration,
+    ) -> Result<Self, KvStoreError>
+    where
+        P: AsRef<Path>,
+        I: IntoIterator<Item = ColumnFamilyDescriptor>,
+    {
+        let db = DB::open_cf_descriptors_with_ttl(opts, path, cfs, default_ttl)?;
+        Ok(Self { db: Arc::new(db) })
     }
 
     pub fn open_with_existing_cfs<P: AsRef<Path>>(
@@ -91,6 +125,13 @@ impl RocksDB {
 
     pub fn list_cf<P: AsRef<Path>>(path: P) -> Result<Vec<String>, KvStoreError> {
         DB::list_cf(&Options::default(), path).map_err(Into::into)
+    }
+
+    pub fn compact_cf(&self, cf: &str) -> Result<(), KvStoreError> {
+        let cf_handle = self.cf_handle(cf)?;
+        self.db
+            .compact_range_cf(&cf_handle, None::<&[u8]>, None::<&[u8]>);
+        Ok(())
     }
 
     pub fn default_opts() -> Options {
@@ -118,12 +159,11 @@ impl RocksDB {
                 .map(|p| p.get() as i32 * 2)
                 .unwrap_or(8),
         );
-        // Tiered compression: fast on hot data, dense on cold
         opts.set_compression_per_level(&[
-            DBCompressionType::None, // L0 — active writes, skip compression
-            DBCompressionType::Lz4,  // L1
-            DBCompressionType::Lz4,  // L2
-            DBCompressionType::Zstd, // L3+
+            DBCompressionType::None,
+            DBCompressionType::Lz4,
+            DBCompressionType::Lz4,
+            DBCompressionType::Zstd,
             DBCompressionType::Zstd,
             DBCompressionType::Zstd,
             DBCompressionType::Zstd,
@@ -136,7 +176,10 @@ impl RocksDB {
             .cf_handle(cf)
             .ok_or_else(|| KvStoreError::InvalidColumnFamily(cf.to_string()))
     }
+}
 
+// Default CF operations
+impl RocksDB {
     pub fn save(&self, key: &str, value: &[u8]) -> Result<(), KvStoreError> {
         self.db.put(key.as_bytes(), value).map_err(Into::into)
     }
@@ -167,10 +210,25 @@ impl RocksDB {
         }
         self.db.write(batch).map_err(Into::into)
     }
+}
 
+// Column family operations
+impl RocksDB {
     pub fn create_cf(&self, name: &str) -> Result<(), KvStoreError> {
         if !self.cf_exists(name) {
             self.db.create_cf(name, &Options::default())?;
+        }
+        Ok(())
+    }
+    pub fn create_cf_with_ttl(&self, name: &str, ttl_secs: u64) -> Result<(), KvStoreError> {
+        if !self.cf_exists(name) {
+            let mut cf_opts = Options::default();
+            cf_opts.set_periodic_compaction_seconds(ttl_secs.clamp(300, 86400));
+            self.db.create_cf_with_ttl(
+                name,
+                &Options::default(),
+                std::time::Duration::from_secs(ttl_secs),
+            )?;
         }
         Ok(())
     }
@@ -242,7 +300,10 @@ impl RocksDB {
             blob_bytes: blob,
         })
     }
+}
 
+// Range queries
+impl RocksDB {
     pub fn get_range_cf(
         &self,
         cf: &str,
@@ -258,7 +319,7 @@ impl RocksDB {
             Direction::Reverse => IteratorMode::From(to.as_bytes(), Direction::Reverse),
         };
 
-        let mut results = Vec::with_capacity(limit);
+        let mut results = Vec::with_capacity(1024);
         for item in self.db.iterator_cf(&cf_handle, mode).take(limit) {
             let (key, value_bytes) = item?;
             let key_str = String::from_utf8_lossy(&key);
@@ -284,6 +345,25 @@ impl RocksDB {
         Ok(results)
     }
 
+    pub fn get_range_cf_as<T: DeserializeOwned>(
+        &self,
+        cf: &str,
+        from: &str,
+        to: &str,
+        limit: usize,
+        direction: Direction,
+    ) -> Result<Vec<T>, KvStoreError> {
+        self.get_range_cf(cf, from, to, limit, direction, false)?
+            .into_iter()
+            .map(|v| {
+                serde_json::from_value(v).map_err(|e| KvStoreError::Serialization(e.to_string()))
+            })
+            .collect()
+    }
+}
+
+// JSONPath queries
+impl RocksDB {
     pub fn query_cf(
         &self,
         cf: &str,
@@ -303,7 +383,6 @@ impl RocksDB {
             keys.push(String::from_utf8_lossy(&key).into_owned());
             originals.push(value.clone());
 
-            // Inject index for O(1) result mapping
             let mut obj = value;
             if let Some(map) = obj.as_object_mut() {
                 map.insert("__idx".to_string(), serde_json::json!(tagged.len()));
@@ -338,7 +417,7 @@ impl RocksDB {
 
         Ok(results)
     }
-    // Convenience — nice ergonomics for library users
+
     pub fn query_cf_as<T: DeserializeOwned>(
         &self,
         cf: &str,
@@ -351,24 +430,10 @@ impl RocksDB {
             })
             .collect()
     }
+}
 
-    // Same for range
-    pub fn get_range_cf_as<T: DeserializeOwned>(
-        &self,
-        cf: &str,
-        from: &str,
-        to: &str,
-        limit: usize,
-        direction: Direction,
-    ) -> Result<Vec<T>, KvStoreError> {
-        self.get_range_cf(cf, from, to, limit, direction, false)?
-            .into_iter()
-            .map(|v| {
-                serde_json::from_value(v).map_err(|e| KvStoreError::Serialization(e.to_string()))
-            })
-            .collect()
-    }
-
+// Backup / restore
+impl RocksDB {
     pub fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
         let cf_handle = self.cf_handle(cf)?;
         let opts = Options::default();

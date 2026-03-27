@@ -1,6 +1,7 @@
-use rocksdb_client::{Direction, KVStore, KvStoreError, Options, RocksDB};
-use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use rocksdb_client::{DBCompressionType, Direction, KvStoreError, Options, RocksDB};
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct User {
@@ -8,6 +9,7 @@ struct User {
     name: String,
     created_at: i64,
 }
+
 impl User {
     fn new(id: u64, name: &str) -> Self {
         Self {
@@ -20,6 +22,7 @@ impl User {
         }
     }
 }
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Room {
     id: u64,
@@ -41,27 +44,22 @@ enum MatchStyle {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize database with column families
     let path = "./data";
     let column_families = vec!["users", "settings", "rooms"];
-    let mut opts = Options::default();
-    opts.create_if_missing(true);
-    opts.create_missing_column_families(true);
+    let mut opts = RocksDB::default_opts();
+    opts.set_compression_type(DBCompressionType::None);
 
-    // Try to open with default CFs first, if it fails use existing CFs
     let db = match RocksDB::open_cf(&opts, path, column_families) {
         Ok(db) => db,
         Err(_) => RocksDB::open_with_existing_cfs(&opts, path)?,
     };
 
-    // List existing column families
     println!("Current column families:");
     let cfs = RocksDB::list_cf(path)?;
     for cf in &cfs {
         println!("- {}", cf);
     }
 
-    // Insert sample data
     let users = vec![
         User::new(1, "Alice"),
         User::new(2, "Charlie"),
@@ -100,25 +98,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ];
 
-    // Insert users individually
     for user in &users {
         db.insert(&user.id.to_string(), user)?;
     }
-
-    // Insert rooms and settings using column families
     for room in &rooms {
         db.insert_cf("rooms", &room.id.to_string(), room)?;
     }
-
     for setting in &settings {
         db.insert_cf("settings", &setting.id.to_string(), setting)?;
     }
 
-    // Create a new column family during runtime
     println!("\nCreating new column family 'archived_rooms'");
     db.create_cf("archived_rooms")?;
 
-    // Add data to the new column family
     let archived_room = Room {
         id: 999,
         name: "Old Team".to_string(),
@@ -131,66 +123,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &archived_room,
     )?;
 
-    // Implement room filtering by style
     println!("\nFiltering rooms by style:");
     let filtered_rooms = filter_rooms_by_style(&db, MatchStyle::Team)?;
     for room in filtered_rooms {
-        println!("Team room: {:?}", room);
+        println!("Team room: {}", room);
     }
 
-    // Demonstrate range queries
     println!("\nRooms within ID range 1-2:");
-    let range_rooms: Vec<Room> =
-        db.get_range_cf("rooms", "1", "2", 1000, Direction::Forward, false)?;
+    let range_rooms = db.get_range_cf("rooms", "1", "2", 1000, Direction::Forward, false)?;
     for room in range_rooms {
-        println!("Room in range: {:?}", room);
+        println!("Room in range: {}", room);
     }
 
-    // Print all entries in each column family
     print_cf_contents(&db)?;
-    // Create backup of rooms
+
     println!("\n=== Creating backup of rooms collection ===");
     db.create_backup("rooms", "rooms_backup.sst")?;
     println!("Backup created successfully");
 
-    // Drop the rooms collection
     println!("\n=== Dropping rooms collection ===");
     db.drop_cf("rooms")?;
     println!("Collection dropped");
 
-    // Create new empty rooms collection
     db.create_cf("rooms")?;
 
-    // Print state after drop
     println!("\n=== State after dropping rooms ===");
     print_cf_contents(&db)?;
 
-    // Restore from backup
     println!("\n=== Restoring rooms from backup ===");
     db.restore_backup("rooms", "rooms_backup.sst")?;
     println!("Restore completed");
 
-    // Print final state
     println!("\n=== Final State after restore ===");
     print_cf_contents(&db)?;
 
     Ok(())
 }
 
-// Helper function to filter rooms by style
-fn filter_rooms_by_style(db: &RocksDB, style: MatchStyle) -> Result<Vec<Room>, KvStoreError> {
-    let rooms: Vec<Room> = db.get_range_cf("rooms", "0", "999", 1000, Direction::Forward, true)?;
+fn filter_rooms_by_style(
+    db: &RocksDB,
+    style: MatchStyle,
+) -> Result<Vec<serde_json::Value>, KvStoreError> {
+    let rooms = db.get_range_cf("rooms", "0", "999", 1000, Direction::Forward, false)?;
     Ok(rooms
         .into_iter()
-        .filter(|room| room.style == style)
+        .filter(|room| {
+            room.get("style").and_then(|s| s.as_str())
+                == Some(if style == MatchStyle::Team {
+                    "Team"
+                } else {
+                    "Dm"
+                })
+        })
         .collect())
 }
 
-// Helper function to print contents and sizes of all column families
 fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
     println!("\nContents and sizes of all column families:");
 
-    // Helper function to print CF size
     let print_cf_size = |cf: &str| -> Result<(), KvStoreError> {
         let size = db.get_cf_size(cf)?;
         println!("\n{} Size:", cf);
@@ -201,7 +191,6 @@ fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
         Ok(())
     };
 
-    // Print users (from default CF)
     println!("\nUsers:");
     print_cf_size("default")?;
     for id in 1..=3 {
@@ -212,27 +201,23 @@ fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
         }
     }
 
-    // Print rooms
     println!("\nRooms:");
     print_cf_size("rooms")?;
-    let rooms: Vec<Room> = db.get_range_cf("rooms", "0", "999", 1000, Direction::Forward, false)?;
+    let rooms = db.get_range_cf("rooms", "0", "999", 1000, Direction::Forward, false)?;
     for room in rooms {
-        println!("- {:?}", room);
+        println!("- {}", room);
     }
 
-    // Print settings
     println!("\nSettings:");
     print_cf_size("settings")?;
-    let settings: Vec<Settings> =
-        db.get_range_cf("settings", "0", "999", 1000, Direction::Forward, false)?;
+    let settings = db.get_range_cf("settings", "0", "999", 1000, Direction::Forward, false)?;
     for setting in settings {
-        println!("- {:?}", setting);
+        println!("- {}", setting);
     }
 
-    // Print archived rooms
     println!("\nArchived Rooms:");
     print_cf_size("archived_rooms")?;
-    let archived_rooms: Vec<Room> = db.get_range_cf(
+    let archived = db.get_range_cf(
         "archived_rooms",
         "0",
         "999",
@@ -240,8 +225,8 @@ fn print_cf_contents(db: &RocksDB) -> Result<(), KvStoreError> {
         Direction::Forward,
         false,
     )?;
-    for room in archived_rooms {
-        println!("- {:?}", room);
+    for room in archived {
+        println!("- {}", room);
     }
 
     Ok(())

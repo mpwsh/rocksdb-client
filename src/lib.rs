@@ -1,37 +1,32 @@
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 use jsonpath_rust::JsonPath;
-pub use rocksdb::{ColumnFamilyDescriptor, CuckooTableOptions, Direction, Options};
+pub use rocksdb::{ColumnFamilyDescriptor, DBCompressionType, Direction, Options};
 use rocksdb::{IngestExternalFileOptions, IteratorMode, SstFileWriter, WriteBatch, DB};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-pub mod errors;
-use std::sync::Arc;
+use serde::{de::DeserializeOwned, Serialize};
 
+pub mod errors;
 pub use errors::KvStoreError;
 
-#[derive(Serialize, Deserialize)]
+// --- Serialization ---
+
+fn serialize<T: Serialize>(value: &T) -> Result<Vec<u8>, KvStoreError> {
+    serde_json::to_vec(value).map_err(|e| KvStoreError::Serialization(e.to_string()))
+}
+
+fn deserialize<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, KvStoreError> {
+    serde_json::from_slice(bytes).map_err(|e| KvStoreError::Serialization(e.to_string()))
+}
+
+// --- Types ---
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KeyValuePair<T> {
     pub key: String,
     pub value: T,
 }
 
-pub trait ByteSerializer {
-    fn serialize<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, KvStoreError>;
-    fn deserialize<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, KvStoreError>;
-}
-
-pub struct MessagePackSerializer;
-
-impl ByteSerializer for MessagePackSerializer {
-    fn serialize<T: Serialize>(&self, value: &T) -> Result<Vec<u8>, KvStoreError> {
-        rmp_serde::to_vec(value).map_err(Into::into)
-    }
-
-    fn deserialize<T: DeserializeOwned>(&self, bytes: &[u8]) -> Result<T, KvStoreError> {
-        rmp_serde::from_slice(bytes).map_err(Into::into)
-    }
-}
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CFSize {
     pub total_bytes: u64,
     pub sst_bytes: u64,
@@ -44,484 +39,355 @@ impl CFSize {
         self.total_bytes as f64 / (1024.0 * 1024.0)
     }
 }
-pub trait KVStore: Sized {
-    fn open<P: AsRef<Path>>(path: P, opts: &Options) -> Result<Self, KvStoreError>;
-    fn open_default<P: AsRef<Path>>(path: P) -> Result<Self, KvStoreError>;
-    fn open_cf<P, I, N>(opts: &Options, path: P, cfs: I) -> Result<Self, KvStoreError>
-    where
-        P: AsRef<Path>,
-        I: IntoIterator<Item = N>,
-        N: AsRef<str>;
-    fn open_with_existing_cfs<P: AsRef<Path>>(
-        opts: &Options,
-        path: P,
-    ) -> Result<Self, KvStoreError>;
-    fn cf_handle(&self, cf: &str) -> Result<Arc<rocksdb::BoundColumnFamily>, KvStoreError>;
-    fn save(&self, k: &str, v: &[u8]) -> Result<(), KvStoreError>;
-    fn find(&self, k: &str) -> Result<Option<Vec<u8>>, KvStoreError>;
-    fn delete(&self, k: &str) -> Result<(), KvStoreError>;
-    fn list_cf(path: &str) -> Result<Vec<String>, KvStoreError>;
-    fn get<T: DeserializeOwned>(&self, key: &str) -> Result<T, KvStoreError>;
-    fn insert<T: Serialize>(&self, key: &str, v: &T) -> Result<(), KvStoreError>;
-    fn batch_insert<T: Serialize>(&self, items: &[(&str, &T)]) -> Result<(), KvStoreError>;
-    fn batch_insert_cf<T: Serialize>(
-        &self,
-        cf: &str,
-        items: &[(&str, &T)],
-    ) -> Result<(), KvStoreError>;
-    fn create_cf(&self, name: &str) -> Result<(), KvStoreError>;
-    fn cf_exists(&self, name: &str) -> bool;
-    fn insert_cf<T: Serialize>(&self, cf: &str, key: &str, value: &T) -> Result<(), KvStoreError>;
-    fn get_cf<T: DeserializeOwned>(&self, cf: &str, key: &str) -> Result<T, KvStoreError>;
-    fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError>;
-    fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError>;
-    fn get_cf_size(&self, cf: &str) -> Result<CFSize, KvStoreError>;
-    fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
-    fn restore_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError>;
-    fn query_cf<T: DeserializeOwned + Serialize>(
-        &self,
-        cf: &str,
-        query: &str,
-    ) -> Result<Vec<T>, KvStoreError>;
-    fn query_cf_with_keys<T: DeserializeOwned + Serialize>(
-        &self,
-        cf: &str,
-        query: &str,
-    ) -> Result<Vec<KeyValuePair<T>>, KvStoreError>;
-    fn get_range_cf<T: DeserializeOwned + Serialize>(
-        &self,
-        cf: &str,
-        from: &str,
-        to: &str,
-        limit: usize,
-        direction: Direction,
-    ) -> Result<Vec<T>, KvStoreError>;
-    fn get_range_cf_with_keys<T: DeserializeOwned + Serialize>(
-        &self,
-        cf: &str,
-        from: &str,
-        to: &str,
-        limit: usize,
-        direction: Direction,
-    ) -> Result<Vec<KeyValuePair<T>>, KvStoreError>;
-}
+
+// --- Database ---
 
 #[derive(Clone)]
 pub struct RocksDB {
     db: Arc<DB>,
 }
 
-impl KVStore for RocksDB {
-    fn open<P: AsRef<Path>>(path: P, opts: &Options) -> Result<Self, KvStoreError> {
-        DB::open(opts, path)
-            .map(|db| RocksDB { db: Arc::new(db) })
-            .map_err(KvStoreError::from)
+// Opening / lifecycle
+impl RocksDB {
+    pub fn open<P: AsRef<Path>>(path: P, opts: &Options) -> Result<Self, KvStoreError> {
+        Ok(Self {
+            db: Arc::new(DB::open(opts, path)?),
+        })
     }
 
-    fn open_default<P: AsRef<Path>>(path: P) -> Result<Self, KvStoreError> {
-        DB::open_default(path)
-            .map(|db| RocksDB { db: Arc::new(db) })
-            .map_err(KvStoreError::from)
+    pub fn open_default<P: AsRef<Path>>(path: P) -> Result<Self, KvStoreError> {
+        Ok(Self {
+            db: Arc::new(DB::open_default(path)?),
+        })
     }
 
-    fn open_cf<P, I, N>(opts: &Options, path: P, cfs: I) -> Result<Self, KvStoreError>
+    pub fn open_cf<P, I, N>(opts: &Options, path: P, cfs: I) -> Result<Self, KvStoreError>
     where
         P: AsRef<Path>,
         I: IntoIterator<Item = N>,
         N: AsRef<str>,
     {
         let cf_names: Vec<String> = cfs.into_iter().map(|n| n.as_ref().to_string()).collect();
-        let db = DB::open_cf(opts, path, cf_names)?;
-        Ok(RocksDB { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(DB::open_cf(opts, path, cf_names)?),
+        })
     }
-    fn open_with_existing_cfs<P: AsRef<Path>>(
+
+    pub fn open_with_existing_cfs<P: AsRef<Path>>(
         opts: &Options,
         path: P,
     ) -> Result<Self, KvStoreError> {
         let db_path = path.as_ref();
-        let current_file = db_path.join("CURRENT");
-
-        let cf_names = if db_path.exists() && current_file.exists() {
-            // Existing database
-            Self::list_cf(db_path.to_str().unwrap())?
+        let cf_names = if db_path.join("CURRENT").exists() {
+            Self::list_cf(db_path)?
         } else {
-            // New database or not initialized
             if !db_path.exists() {
                 std::fs::create_dir_all(db_path)?;
             }
             vec!["default".to_string()]
         };
-
         Self::open_cf(opts, path, cf_names)
     }
-    fn cf_handle(&self, cf: &str) -> Result<Arc<rocksdb::BoundColumnFamily>, KvStoreError> {
+
+    pub fn list_cf<P: AsRef<Path>>(path: P) -> Result<Vec<String>, KvStoreError> {
+        DB::list_cf(&Options::default(), path).map_err(Into::into)
+    }
+
+    pub fn default_opts() -> Options {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.create_missing_column_families(true);
+        let cpus = std::thread::available_parallelism()
+            .map(|p| p.get() as i32)
+            .unwrap_or(4);
+        opts.increase_parallelism(cpus);
+        opts.set_compression_type(DBCompressionType::Lz4);
+        opts
+    }
+
+    pub fn write_optimized_opts() -> Options {
+        let mut opts = Self::default_opts();
+        opts.set_enable_pipelined_write(true);
+        opts.set_write_buffer_size(64 * 1024 * 1024);
+        opts.set_max_write_buffer_number(8);
+        opts.set_min_write_buffer_number_to_merge(1);
+        opts.set_allow_concurrent_memtable_write(true);
+        opts.set_manual_wal_flush(true);
+        opts.set_max_background_jobs(
+            std::thread::available_parallelism()
+                .map(|p| p.get() as i32 * 2)
+                .unwrap_or(8),
+        );
+        // Tiered compression: fast on hot data, dense on cold
+        opts.set_compression_per_level(&[
+            DBCompressionType::None, // L0 — active writes, skip compression
+            DBCompressionType::Lz4,  // L1
+            DBCompressionType::Lz4,  // L2
+            DBCompressionType::Zstd, // L3+
+            DBCompressionType::Zstd,
+            DBCompressionType::Zstd,
+            DBCompressionType::Zstd,
+        ]);
+        opts
+    }
+
+    fn cf_handle(&self, cf: &str) -> Result<Arc<rocksdb::BoundColumnFamily<'_>>, KvStoreError> {
         self.db
             .cf_handle(cf)
             .ok_or_else(|| KvStoreError::InvalidColumnFamily(cf.to_string()))
     }
-    fn list_cf(path: &str) -> Result<Vec<String>, KvStoreError> {
-        let cf_names = DB::list_cf(&Options::default(), path).map_err(KvStoreError::from)?;
-        Ok(cf_names)
-    }
-    fn save(&self, k: &str, v: &[u8]) -> Result<(), KvStoreError> {
-        self.db.put(k.as_bytes(), v).map_err(KvStoreError::from)
+
+    pub fn save(&self, key: &str, value: &[u8]) -> Result<(), KvStoreError> {
+        self.db.put(key.as_bytes(), value).map_err(Into::into)
     }
 
-    fn find(&self, k: &str) -> Result<Option<Vec<u8>>, KvStoreError> {
-        self.db.get(k.as_bytes()).map_err(KvStoreError::from)
+    pub fn find(&self, key: &str) -> Result<Option<Vec<u8>>, KvStoreError> {
+        self.db.get(key.as_bytes()).map_err(Into::into)
     }
 
-    fn delete(&self, k: &str) -> Result<(), KvStoreError> {
-        self.db.delete(k.as_bytes()).map_err(KvStoreError::from)
+    pub fn delete(&self, key: &str) -> Result<(), KvStoreError> {
+        self.db.delete(key.as_bytes()).map_err(Into::into)
     }
 
-    fn get<T: DeserializeOwned>(&self, key: &str) -> Result<T, KvStoreError> {
+    pub fn get<T: DeserializeOwned>(&self, key: &str) -> Result<T, KvStoreError> {
         let value = self
             .find(key)?
             .ok_or_else(|| KvStoreError::KeyNotFound(key.to_string()))?;
-        MessagePackSerializer.deserialize(&value)
+        deserialize(&value)
     }
 
-    fn insert<T: Serialize>(&self, key: &str, v: &T) -> Result<(), KvStoreError> {
-        let serialized = MessagePackSerializer.serialize(v)?;
-        self.save(key, &serialized)
+    pub fn insert<T: Serialize>(&self, key: &str, value: &T) -> Result<(), KvStoreError> {
+        self.save(key, &serialize(value)?)
     }
-    fn batch_insert<T: Serialize>(&self, items: &[(&str, &T)]) -> Result<(), KvStoreError> {
+
+    pub fn batch_insert<T: Serialize>(&self, items: &[(&str, &T)]) -> Result<(), KvStoreError> {
         let mut batch = WriteBatch::default();
-
         for (key, value) in items {
-            let serialized = MessagePackSerializer.serialize(value)?;
-            batch.put(key.as_bytes(), &serialized);
+            batch.put(key.as_bytes(), &serialize(value)?);
         }
-
-        self.db.write(batch).map_err(KvStoreError::from)
+        self.db.write(batch).map_err(Into::into)
     }
-    fn batch_insert_cf<T: Serialize>(
+
+    pub fn create_cf(&self, name: &str) -> Result<(), KvStoreError> {
+        if !self.cf_exists(name) {
+            self.db.create_cf(name, &Options::default())?;
+        }
+        Ok(())
+    }
+
+    pub fn cf_exists(&self, name: &str) -> bool {
+        self.db.cf_handle(name).is_some()
+    }
+
+    pub fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError> {
+        self.db.drop_cf(cf).map_err(Into::into)
+    }
+
+    pub fn insert_cf<T: Serialize>(
+        &self,
+        cf: &str,
+        key: &str,
+        value: &T,
+    ) -> Result<(), KvStoreError> {
+        let cf_handle = self.cf_handle(cf)?;
+        self.db
+            .put_cf(&cf_handle, key.as_bytes(), serialize(value)?)
+            .map_err(Into::into)
+    }
+
+    pub fn get_cf<T: DeserializeOwned>(&self, cf: &str, key: &str) -> Result<T, KvStoreError> {
+        let cf_handle = self.cf_handle(cf)?;
+        let value = self
+            .db
+            .get_cf(&cf_handle, key.as_bytes())?
+            .ok_or_else(|| KvStoreError::KeyNotFound(key.to_string()))?;
+        deserialize(&value)
+    }
+
+    pub fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError> {
+        let cf_handle = self.cf_handle(cf)?;
+        self.db
+            .delete_cf(&cf_handle, key.as_bytes())
+            .map_err(Into::into)
+    }
+
+    pub fn batch_insert_cf<T: Serialize>(
         &self,
         cf: &str,
         items: &[(&str, &T)],
     ) -> Result<(), KvStoreError> {
         let cf_handle = self.cf_handle(cf)?;
-
         let mut batch = WriteBatch::default();
         for (key, value) in items {
-            let serialized = MessagePackSerializer.serialize(value)?;
-            batch.put_cf(&cf_handle, key.as_bytes(), &serialized);
+            batch.put_cf(&cf_handle, key.as_bytes(), &serialize(value)?);
         }
-
-        self.db.write(batch).map_err(KvStoreError::from)
+        self.db.write(batch).map_err(Into::into)
     }
-    fn create_cf(&self, name: &str) -> Result<(), KvStoreError> {
-        if !self.cf_exists(name) {
+
+    pub fn get_cf_size(&self, cf: &str) -> Result<CFSize, KvStoreError> {
+        let cf_handle = self.cf_handle(cf)?;
+        let prop = |name| -> Result<u64, KvStoreError> {
             self.db
-                .create_cf(name, &Options::default())
-                .map_err(KvStoreError::from)?;
-        }
-        Ok(())
-    }
-
-    fn cf_exists(&self, name: &str) -> bool {
-        self.db.cf_handle(name).is_some()
-    }
-    fn insert_cf<T: Serialize>(&self, cf: &str, key: &str, value: &T) -> Result<(), KvStoreError> {
-        let cf_handle = self.cf_handle(cf)?;
-
-        let serialized = MessagePackSerializer.serialize(value)?;
-        self.db
-            .put_cf(&cf_handle, key.as_bytes(), serialized)
-            .map_err(KvStoreError::from)
-    }
-
-    fn get_cf<T: DeserializeOwned>(&self, cf: &str, key: &str) -> Result<T, KvStoreError> {
-        let cf_handle = self.cf_handle(cf)?;
-        let value = self
-            .db
-            .get_cf(&cf_handle, key.as_bytes())?
-            .ok_or(KvStoreError::KeyNotFound(key.to_string()))?;
-        MessagePackSerializer.deserialize(&value)
-    }
-
-    fn delete_cf(&self, cf: &str, key: &str) -> Result<(), KvStoreError> {
-        let cf_handle = self.cf_handle(cf)?;
-
-        let _ = self
-            .db
-            .get_cf(&cf_handle, key.as_bytes())?
-            .ok_or(KvStoreError::KeyNotFound(key.to_string()))?;
-        self.db
-            .delete_cf(&cf_handle, key.as_bytes())
-            .map_err(KvStoreError::from)
-    }
-
-    fn drop_cf(&self, cf: &str) -> Result<(), KvStoreError> {
-        self.db.drop_cf(cf).map_err(KvStoreError::from)
-    }
-    fn get_cf_size(&self, cf: &str) -> Result<CFSize, KvStoreError> {
-        let cf_handle = self.cf_handle(cf)?;
-
-        let live_sst_size = self
-            .db
-            .property_int_value_cf(&cf_handle, "rocksdb.total-sst-files-size")
-            .map_err(|e| KvStoreError::PropertyAccessError(e.to_string()))?
-            .unwrap_or(0);
-
-        let mem_table_size = self
-            .db
-            .property_int_value_cf(&cf_handle, "rocksdb.size-all-mem-tables")
-            .map_err(|e| KvStoreError::PropertyAccessError(e.to_string()))?
-            .unwrap_or(0);
-
-        let blob_size = self
-            .db
-            .property_int_value_cf(&cf_handle, "rocksdb.total-blob-file-size")
-            .map_err(|e| KvStoreError::PropertyAccessError(e.to_string()))?
-            .unwrap_or(0);
-
+                .property_int_value_cf(&cf_handle, name)
+                .map_err(|e| KvStoreError::Serialization(e.to_string()))
+                .map(|v| v.unwrap_or(0))
+        };
+        let sst = prop("rocksdb.total-sst-files-size")?;
+        let mem = prop("rocksdb.size-all-mem-tables")?;
+        let blob = prop("rocksdb.total-blob-file-size")?;
         Ok(CFSize {
-            total_bytes: live_sst_size + mem_table_size + blob_size,
-            sst_bytes: live_sst_size,
-            mem_table_bytes: mem_table_size,
-            blob_bytes: blob_size,
+            total_bytes: sst + mem + blob,
+            sst_bytes: sst,
+            mem_table_bytes: mem,
+            blob_bytes: blob,
         })
     }
 
-    fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
-        let cf_handle = self.cf_handle(cf)?;
-
-        // Create a new SST file writer
-        let mut opts = Options::default();
-        opts.create_if_missing(true);
-        let mut writer = SstFileWriter::create(&opts);
-
-        // Open the writer with the specified file path
-        writer.open(path)?;
-
-        // Get an iterator over the CF
-        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
-
-        // Write all KV pairs to the SST file
-        for item in iter {
-            let (key, value) = item?;
-            writer.put(&key, &value)?;
-        }
-
-        // Finish writing and close the file
-        writer.finish()?;
-
-        Ok(())
-    }
-
-    fn restore_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
-        let cf_handle = self.cf_handle(cf)?;
-
-        // Create ingest options
-        let ingest_opts = IngestExternalFileOptions::default();
-
-        // Ingest the SST file
-        self.db
-            .ingest_external_file_cf_opts(&cf_handle, &ingest_opts, vec![path])?;
-
-        Ok(())
-    }
-    fn query_cf<T: DeserializeOwned + Serialize>(
-        &self,
-        cf: &str,
-        query: &str,
-    ) -> Result<Vec<T>, KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or_else(|| KvStoreError::InvalidColumnFamily(cf.to_string()))?;
-
-        // Collect all document data
-        let mut documents = Vec::new();
-        let mut json_values = Vec::new();
-
-        // Single pass collection of data
-        for item in self.db.iterator_cf(&cf_handle, IteratorMode::Start) {
-            let (_, value_bytes) = item?;
-            let value: T = MessagePackSerializer.deserialize(&value_bytes)?;
-
-            // Convert to JSON for querying only once
-            let json_value = serde_json::to_value(&value)
-                .map_err(|e| KvStoreError::SerializationError(e.to_string()))?;
-
-            documents.push(value);
-            json_values.push(json_value);
-        }
-
-        // Create JSON array and run query
-        let json_array = serde_json::Value::Array(json_values.clone());
-
-        let matches = match json_array.query(query) {
-            Ok(m) => m,
-            Err(e) => return Err(KvStoreError::InvalidQuery(format!("JSONPath error: {}", e))),
-        };
-
-        // Build result set by taking ownership of matching values
-        let mut final_results = Vec::with_capacity(matches.len());
-
-        for matched_value in matches {
-            for (i, json_value) in json_values.iter().enumerate() {
-                if matched_value == json_value {
-                    // Take ownership of the value using swap_remove - O(1) operation
-                    final_results.push(documents.swap_remove(i));
-                    json_values.swap_remove(i);
-                    break;
-                }
-            }
-        }
-
-        Ok(final_results)
-    }
-
-    // Query implementation with key-value pairs
-    fn query_cf_with_keys<T: DeserializeOwned + Serialize>(
-        &self,
-        cf: &str,
-        query: &str,
-    ) -> Result<Vec<KeyValuePair<T>>, KvStoreError> {
-        let cf_handle = self
-            .db
-            .cf_handle(cf)
-            .ok_or_else(|| KvStoreError::InvalidColumnFamily(cf.to_string()))?;
-
-        // Collect all document data with keys
-        let mut documents_with_keys = Vec::new();
-        let mut json_values = Vec::new();
-
-        // Single pass collection of data
-        for item in self.db.iterator_cf(&cf_handle, IteratorMode::Start) {
-            let (key, value_bytes) = item?;
-            let value: T = MessagePackSerializer.deserialize(&value_bytes)?;
-
-            // Convert to JSON for querying only once
-            let json_value = serde_json::to_value(&value)
-                .map_err(|e| KvStoreError::SerializationError(e.to_string()))?;
-
-            documents_with_keys.push((key.to_vec(), value));
-            json_values.push(json_value);
-        }
-
-        // Create JSON array and run query
-        let json_array = serde_json::Value::Array(json_values.clone());
-
-        let matches = match json_array.query(query) {
-            Ok(m) => m,
-            Err(e) => return Err(KvStoreError::InvalidQuery(format!("JSONPath error: {}", e))),
-        };
-
-        // Build result set by taking ownership of matching values
-        let mut final_results = Vec::with_capacity(matches.len());
-
-        for matched_value in matches {
-            for (i, json_value) in json_values.iter().enumerate() {
-                if matched_value == json_value {
-                    // Get key and value
-                    let (key, value) = documents_with_keys.swap_remove(i);
-
-                    // Convert key to string
-                    let key_str = String::from_utf8_lossy(&key).into_owned();
-
-                    // Create a KeyValuePair directly
-                    final_results.push(KeyValuePair {
-                        key: key_str,
-                        value,
-                    });
-
-                    // Remove from json values to avoid duplicate matches
-                    json_values.swap_remove(i);
-                    break;
-                }
-            }
-        }
-
-        Ok(final_results)
-    }
-
-    // Values-only range implementation
-    fn get_range_cf<T: DeserializeOwned + Serialize>(
+    pub fn get_range_cf(
         &self,
         cf: &str,
         from: &str,
         to: &str,
         limit: usize,
         direction: Direction,
-    ) -> Result<Vec<T>, KvStoreError> {
+        include_keys: bool,
+    ) -> Result<Vec<serde_json::Value>, KvStoreError> {
         let cf_handle = self.cf_handle(cf)?;
-        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
-        let all_keys: Vec<Vec<u8>> = iter
-            .map(|r| r.map(|(k, _)| k.to_vec()))
-            .collect::<Result<_, _>>()?;
-
-        let from_idx = from.parse::<usize>().unwrap_or(0);
-        let to_idx = to.parse::<usize>().unwrap_or(all_keys.len());
-        let from_idx = from_idx.min(all_keys.len());
-        let to_idx = (to_idx + 1).min(all_keys.len());
-
-        let keys_to_fetch = match direction {
-            Direction::Forward => all_keys[from_idx..to_idx].to_vec(),
-            Direction::Reverse => {
-                let mut keys = all_keys[from_idx..to_idx].to_vec();
-                keys.reverse();
-                keys
-            }
+        let mode = match direction {
+            Direction::Forward => IteratorMode::From(from.as_bytes(), Direction::Forward),
+            Direction::Reverse => IteratorMode::From(to.as_bytes(), Direction::Reverse),
         };
 
-        let mut results = Vec::with_capacity(limit.min(keys_to_fetch.len()));
-        for key in keys_to_fetch.iter().take(limit) {
-            if let Some(value) = self.db.get_cf(&cf_handle, key)? {
-                let value: T = MessagePackSerializer.deserialize(&value)?;
+        let mut results = Vec::with_capacity(limit);
+        for item in self.db.iterator_cf(&cf_handle, mode).take(limit) {
+            let (key, value_bytes) = item?;
+            let key_str = String::from_utf8_lossy(&key);
+
+            match direction {
+                Direction::Forward if key_str.as_ref() > to => break,
+                Direction::Reverse if key_str.as_ref() < from => break,
+                _ => {}
+            }
+
+            let value: serde_json::Value = serde_json::from_slice(&value_bytes)
+                .map_err(|e| KvStoreError::Serialization(e.to_string()))?;
+
+            if include_keys {
+                results.push(serde_json::json!({
+                    "key": key_str,
+                    "value": value,
+                }));
+            } else {
                 results.push(value);
             }
         }
-
         Ok(results)
     }
 
-    // Range implementation with key-value pairs
-    fn get_range_cf_with_keys<T: DeserializeOwned + Serialize>(
+    pub fn query_cf(
+        &self,
+        cf: &str,
+        query: &str,
+        include_keys: bool,
+    ) -> Result<Vec<serde_json::Value>, KvStoreError> {
+        let cf_handle = self.cf_handle(cf)?;
+
+        let mut keys = Vec::new();
+        let mut originals = Vec::new();
+        let mut tagged = Vec::new();
+
+        for item in self.db.iterator_cf(&cf_handle, IteratorMode::Start) {
+            let (key, value_bytes) = item?;
+            let value: serde_json::Value = serde_json::from_slice(&value_bytes)
+                .map_err(|e| KvStoreError::Serialization(e.to_string()))?;
+            keys.push(String::from_utf8_lossy(&key).into_owned());
+            originals.push(value.clone());
+
+            // Inject index for O(1) result mapping
+            let mut obj = value;
+            if let Some(map) = obj.as_object_mut() {
+                map.insert("__idx".to_string(), serde_json::json!(tagged.len()));
+            }
+            tagged.push(obj);
+        }
+
+        let json_array = serde_json::Value::Array(tagged);
+        let matches = json_array
+            .query(query)
+            .map_err(|e| KvStoreError::InvalidQuery(format!("JSONPath error: {}", e)))?;
+
+        let mut results = Vec::with_capacity(matches.len());
+        for matched in &matches {
+            if let Some(i) = matched
+                .get("__idx")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+            {
+                if i < originals.len() {
+                    if include_keys {
+                        results.push(serde_json::json!({
+                            "key": keys[i],
+                            "value": originals[i],
+                        }));
+                    } else {
+                        results.push(originals[i].clone());
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+    // Convenience — nice ergonomics for library users
+    pub fn query_cf_as<T: DeserializeOwned>(
+        &self,
+        cf: &str,
+        query: &str,
+    ) -> Result<Vec<T>, KvStoreError> {
+        self.query_cf(cf, query, false)?
+            .into_iter()
+            .map(|v| {
+                serde_json::from_value(v).map_err(|e| KvStoreError::Serialization(e.to_string()))
+            })
+            .collect()
+    }
+
+    // Same for range
+    pub fn get_range_cf_as<T: DeserializeOwned>(
         &self,
         cf: &str,
         from: &str,
         to: &str,
         limit: usize,
         direction: Direction,
-    ) -> Result<Vec<KeyValuePair<T>>, KvStoreError> {
+    ) -> Result<Vec<T>, KvStoreError> {
+        self.get_range_cf(cf, from, to, limit, direction, false)?
+            .into_iter()
+            .map(|v| {
+                serde_json::from_value(v).map_err(|e| KvStoreError::Serialization(e.to_string()))
+            })
+            .collect()
+    }
+
+    pub fn create_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
         let cf_handle = self.cf_handle(cf)?;
-        let iter = self.db.iterator_cf(&cf_handle, IteratorMode::Start);
-        let all_keys: Vec<Vec<u8>> = iter
-            .map(|r| r.map(|(k, _)| k.to_vec()))
-            .collect::<Result<_, _>>()?;
+        let opts = Options::default();
+        let mut writer = SstFileWriter::create(&opts);
+        writer.open(path)?;
 
-        let from_idx = from.parse::<usize>().unwrap_or(0);
-        let to_idx = to.parse::<usize>().unwrap_or(all_keys.len());
-        let from_idx = from_idx.min(all_keys.len());
-        let to_idx = (to_idx + 1).min(all_keys.len());
-
-        let keys_to_fetch = match direction {
-            Direction::Forward => all_keys[from_idx..to_idx].to_vec(),
-            Direction::Reverse => {
-                let mut keys = all_keys[from_idx..to_idx].to_vec();
-                keys.reverse();
-                keys
-            }
-        };
-
-        let mut results = Vec::with_capacity(limit.min(keys_to_fetch.len()));
-        for key in keys_to_fetch.iter().take(limit) {
-            if let Some(value) = self.db.get_cf(&cf_handle, key)? {
-                let value: T = MessagePackSerializer.deserialize(&value)?;
-                let key_str = String::from_utf8_lossy(key).into_owned();
-
-                // Create a KeyValuePair directly
-                results.push(KeyValuePair {
-                    key: key_str,
-                    value,
-                });
-            }
+        for item in self.db.iterator_cf(&cf_handle, IteratorMode::Start) {
+            let (key, value) = item?;
+            writer.put(&key, &value)?;
         }
+        writer.finish()?;
+        Ok(())
+    }
 
-        Ok(results)
+    pub fn restore_backup(&self, cf: &str, path: &str) -> Result<(), KvStoreError> {
+        let cf_handle = self.cf_handle(cf)?;
+        let ingest_opts = IngestExternalFileOptions::default();
+        self.db
+            .ingest_external_file_cf_opts(&cf_handle, &ingest_opts, vec![path])?;
+        Ok(())
     }
 }

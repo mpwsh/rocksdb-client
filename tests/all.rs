@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use rocksdb_client::{KVStore, KvStoreError, Options, RocksDB};
+    use rocksdb_client::{KvStoreError, Options, RocksDB};
     use serde::{Deserialize, Serialize};
     use tempfile::TempDir;
 
@@ -47,38 +47,23 @@ mod tests {
     fn test_crud_operations() {
         let (_temp_dir, db) = create_temp_db();
 
-        // Create
         let save_result = db.save("key1", b"value1");
         assert!(save_result.is_ok(), "Save failed: {:?}", save_result);
 
-        // Read
         let found = db.find("key1");
-        eprintln!("After save, found: {:?}", found); // Debug print
-        assert_eq!(
-            found.unwrap(),
-            Some(b"value1".to_vec()),
-            "Value mismatch after save"
-        );
+        assert_eq!(found.unwrap(), Some(b"value1".to_vec()));
 
-        // Update
         let update_result = db.save("key1", b"new_value1");
         assert!(update_result.is_ok(), "Update failed: {:?}", update_result);
 
         let updated = db.find("key1");
-        eprintln!("After update, found: {:?}", updated); // Debug print
-        assert_eq!(
-            updated.unwrap(),
-            Some(b"new_value1".to_vec()),
-            "Value mismatch after update"
-        );
+        assert_eq!(updated.unwrap(), Some(b"new_value1".to_vec()));
 
-        // Delete
         let delete_result = db.delete("key1");
         assert!(delete_result.is_ok(), "Delete failed: {:?}", delete_result);
 
         let after_delete = db.find("key1");
-        eprintln!("After delete, found: {:?}", after_delete); // Debug print
-        assert_eq!(after_delete.unwrap(), None, "Key still exists after delete");
+        assert_eq!(after_delete.unwrap(), None);
     }
 
     #[test]
@@ -89,10 +74,8 @@ mod tests {
             name: "Alice".to_string(),
         };
 
-        // Insert
         assert!(db.insert("user:1", &user).is_ok());
 
-        // Get
         let retrieved_user: TestUser = db.get("user:1").unwrap();
         assert_eq!(user, retrieved_user);
     }
@@ -109,7 +92,7 @@ mod tests {
     #[test]
     fn test_large_value() {
         let (_temp_dir, db) = create_temp_db();
-        let large_value = vec![0u8; 1_000_000]; // 1MB value
+        let large_value = vec![0u8; 1_000_000];
         assert!(db.save("large_key", &large_value).is_ok());
         assert_eq!(db.find("large_key").unwrap(), Some(large_value));
     }

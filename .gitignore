@@ -1,3 +1,7 @@
 /target
 Cargo.lock
 /data
+.DS_Store
+/rocksdb
+/queries_bench_Data
+rooms_backup.sst
